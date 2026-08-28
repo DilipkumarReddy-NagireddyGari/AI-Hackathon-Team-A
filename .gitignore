@@ -1,0 +1,25 @@
+# Secrets and local settings
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Local application state
+data/*
+!data/.gitkeep
+*.db
+*.sqlite*
+
+# Tooling and editor output
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.vscode/
