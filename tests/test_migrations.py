@@ -16,7 +16,7 @@ def configure_database(monkeypatch, database_path: Path) -> Config:
     return Config(str(PROJECT_ROOT / "alembic.ini"))
 
 
-def assert_t03_schema(database_path: Path) -> None:
+def assert_t04_schema(database_path: Path) -> None:
     with sqlite3.connect(database_path) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
         user_columns = {
@@ -31,9 +31,38 @@ def assert_t03_schema(database_path: Path) -> None:
         profile_foreign_keys = connection.execute(
             "PRAGMA foreign_key_list(learner_profiles)"
         ).fetchall()
+        progress_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(user_item_progress)"
+            ).fetchall()
+        }
+        attempt_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(review_attempts)").fetchall()
+        }
+        completion_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(completed_lesson_metadata)"
+            ).fetchall()
+        }
+        learning_item_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(learning_items)").fetchall()
+        }
+        progress_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(user_item_progress)"
+        ).fetchall()
+        attempt_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(review_attempts)"
+        ).fetchall()
+        completion_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(completed_lesson_metadata)"
+        ).fetchall()
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert revision == ("20260831_0003",)
+    assert revision == ("20260831_0004",)
     assert user_columns == {
         "id",
         "username",
@@ -59,34 +88,86 @@ def assert_t03_schema(database_path: Path) -> None:
     assert len(profile_foreign_keys) == 1
     assert profile_foreign_keys[0][2:5] == ("users", "user_id", "id")
     assert profile_foreign_keys[0][6] == "CASCADE"
+    assert learning_item_columns == {
+        "canonical_id",
+        "category",
+        "jlpt_level",
+        "jlpt_provenance",
+        "jlpt_confidence",
+        "created_at",
+    }
+    assert progress_columns == {
+        "id",
+        "user_id",
+        "item_id",
+        "exposure_count",
+        "correct_count",
+        "incorrect_count",
+        "mastery_score",
+        "last_answered_at",
+        "next_review_at",
+        "created_at",
+        "updated_at",
+    }
+    assert attempt_columns == {
+        "id",
+        "user_id",
+        "item_id",
+        "lesson_session_id",
+        "idempotency_key",
+        "question_form",
+        "is_correct",
+        "is_retry",
+        "answered_at",
+    }
+    assert completion_columns == {
+        "id",
+        "user_id",
+        "lesson_session_id",
+        "topic_id",
+        "difficulty",
+        "studied_item_ids",
+        "completed_at",
+    }
+    assert {(row[2], row[3], row[4], row[6]) for row in progress_foreign_keys} == {
+        ("users", "user_id", "id", "CASCADE"),
+        ("learning_items", "item_id", "canonical_id", "RESTRICT"),
+    }
+    assert {(row[2], row[3], row[4], row[6]) for row in attempt_foreign_keys} == {
+        ("users", "user_id", "id", "CASCADE"),
+        ("learning_items", "item_id", "canonical_id", "RESTRICT"),
+    }
+    assert {(row[2], row[3], row[4], row[6]) for row in completion_foreign_keys} == {
+        ("users", "user_id", "id", "CASCADE"),
+    }
     assert violations == []
 
 
-def test_clean_database_upgrades_to_t03_head(monkeypatch, tmp_path: Path) -> None:
+def test_clean_database_upgrades_to_t04_head(monkeypatch, tmp_path: Path) -> None:
     database_path = tmp_path / "migration.db"
     config = configure_database(monkeypatch, database_path)
 
     command.upgrade(config, "head")
 
-    assert_t03_schema(database_path)
+    assert_t04_schema(database_path)
     get_settings.cache_clear()
 
 
-def test_t02_database_upgrades_to_t03_head(monkeypatch, tmp_path: Path) -> None:
+def test_t03_database_upgrades_to_t04_head(monkeypatch, tmp_path: Path) -> None:
     database_path = tmp_path / "migration.db"
     config = configure_database(monkeypatch, database_path)
 
-    command.upgrade(config, "20260831_0002")
+    command.upgrade(config, "20260831_0003")
     with sqlite3.connect(database_path) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-        profiles_table = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'learner_profiles'"
+        lesson_tables = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'learning_items'"
         ).fetchone()
 
-    assert revision == ("20260831_0002",)
-    assert profiles_table is None
+    assert revision == ("20260831_0003",)
+    assert lesson_tables is None
 
     command.upgrade(config, "head")
 
-    assert_t03_schema(database_path)
+    assert_t04_schema(database_path)
     get_settings.cache_clear()

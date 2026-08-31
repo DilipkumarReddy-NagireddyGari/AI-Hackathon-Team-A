@@ -2,7 +2,19 @@
 
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, String, Text, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -44,3 +56,104 @@ class LearnerProfile(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(), server_default=func.now(), onupdate=func.now()
     )
+
+
+class LearningItem(Base):
+    __tablename__ = "learning_items"
+    __table_args__ = (
+        CheckConstraint(
+            "category IN ('kanji', 'vocabulary', 'grammar')",
+            name="ck_learning_item_category",
+        ),
+        CheckConstraint(
+            "jlpt_confidence >= 0.0 AND jlpt_confidence <= 1.0",
+            name="ck_learning_item_jlpt_confidence",
+        ),
+    )
+
+    canonical_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    category: Mapped[str] = mapped_column(String(32))
+    jlpt_level: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    jlpt_provenance: Mapped[str] = mapped_column(String(32))
+    jlpt_confidence: Mapped[float] = mapped_column(Float())
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+
+
+class UserItemProgress(Base):
+    __tablename__ = "user_item_progress"
+    __table_args__ = (
+        UniqueConstraint("user_id", "item_id", name="uq_progress_user_item"),
+        CheckConstraint("exposure_count >= 0", name="ck_progress_exposure_count"),
+        CheckConstraint("correct_count >= 0", name="ck_progress_correct_count"),
+        CheckConstraint("incorrect_count >= 0", name="ck_progress_incorrect_count"),
+        CheckConstraint(
+            "mastery_score >= 0.0 AND mastery_score <= 1.0",
+            name="ck_progress_mastery_score",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    item_id: Mapped[str] = mapped_column(
+        ForeignKey("learning_items.canonical_id", ondelete="RESTRICT"), index=True
+    )
+    exposure_count: Mapped[int] = mapped_column(Integer(), default=0)
+    correct_count: Mapped[int] = mapped_column(Integer(), default=0)
+    incorrect_count: Mapped[int] = mapped_column(Integer(), default=0)
+    mastery_score: Mapped[float] = mapped_column(Float(), default=0.0)
+    last_answered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(), nullable=True
+    )
+    next_review_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ReviewAttempt(Base):
+    __tablename__ = "review_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "idempotency_key", name="uq_attempt_user_idempotency"
+        ),
+        CheckConstraint(
+            "question_form IN ('meaning', 'reading', 'contextual_cloze')",
+            name="ck_attempt_question_form",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    item_id: Mapped[str] = mapped_column(
+        ForeignKey("learning_items.canonical_id", ondelete="RESTRICT"), index=True
+    )
+    lesson_session_id: Mapped[str] = mapped_column(String(36), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    question_form: Mapped[str] = mapped_column(String(32))
+    is_correct: Mapped[bool] = mapped_column(Boolean())
+    is_retry: Mapped[bool] = mapped_column(Boolean(), default=False)
+    answered_at: Mapped[datetime] = mapped_column(DateTime())
+
+
+class CompletedLessonMetadata(Base):
+    __tablename__ = "completed_lesson_metadata"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "lesson_session_id", name="uq_completion_user_session"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    lesson_session_id: Mapped[str] = mapped_column(String(36))
+    topic_id: Mapped[str] = mapped_column(String(128))
+    difficulty: Mapped[str] = mapped_column(String(32))
+    studied_item_ids: Mapped[list[str]] = mapped_column(JSON)
+    completed_at: Mapped[datetime] = mapped_column(DateTime())

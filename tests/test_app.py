@@ -7,6 +7,7 @@ from streamlit.testing.v1 import AppTest
 from japanese_workplace_tutor.auth import AuthenticationService
 from japanese_workplace_tutor.app import PAGE_RENDERERS
 from japanese_workplace_tutor.database import create_database_engine
+from japanese_workplace_tutor.lesson import FIXTURE_LESSON, LessonService
 from japanese_workplace_tutor.profile import JapaneseLevel, ProfileService
 from japanese_workplace_tutor.settings import Settings, get_settings
 
@@ -160,3 +161,47 @@ def test_onboarding_validates_tasks_and_profile_can_be_edited(
     assert stored is not None
     assert stored.declared_level is JapaneseLevel.N3
     assert stored.tools_domain == "Intellectual property"
+
+
+def test_fixture_lesson_can_be_answered_completed_and_viewed_in_progress(
+    monkeypatch, tmp_path: Path
+) -> None:
+    database_path = tmp_path / "app.db"
+    prepare_database(monkeypatch, database_path)
+    user = create_completed_user(database_path)
+    app = AppTest.from_file(str(PROJECT_ROOT / "app.py")).run()
+    app.session_state["authenticated_user_id"] = user.id
+    app.session_state["authenticated_username"] = user.username
+    app.run()
+
+    app.sidebar.radio[0].set_value("Learn").run()
+    app.button(key="start_fixture_lesson").click().run()
+    active = app.session_state["active_fixture_lesson"]
+
+    for question in FIXTURE_LESSON.questions:
+        answer_key = (
+            f"fixture_answer_{active.lesson_session_id}_{question.question_id}"
+        )
+        submit_key = f"submit_{active.lesson_session_id}_{question.question_id}"
+        app.radio(key=answer_key).set_value(
+            question.options[question.correct_option_index]
+        )
+        app.button(key=submit_key).click().run()
+
+    app.button(key="complete_fixture_lesson").click().run()
+    assert any("Lesson completed" in success.value for success in app.success)
+    assert "active_fixture_lesson" not in app.session_state
+
+    app.sidebar.radio[0].set_value("Progress").run(timeout=10)
+    assert not app.exception
+    assert app.dataframe
+
+    settings = Settings(
+        database_url=f"sqlite:///{database_path.as_posix()}", _env_file=None
+    )
+    engine = create_database_engine(settings)
+    lessons = LessonService(engine)
+    assert len(lessons.get_progress(user.id)) == 5
+    assert sum(record.correct_count for record in lessons.get_progress(user.id)) == 5
+    assert len(lessons.get_completions(user.id)) == 1
+    engine.dispose()

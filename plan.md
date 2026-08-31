@@ -34,7 +34,7 @@ This is a living execution record. After every task, update its status here and 
 | T01 — Secure runnable foundation | **Executed and accepted** | 2026-08-28 | 10 full-suite tests passed; focused secret scan passed; five-page live smoke test passed; see T01 Implementation Result and [verification record](docs/t01-verification.md) |
 | T02 — Local account access | **Executed and accepted** | 2026-08-31 | 17 full-suite tests passed; live registration/login/logout/guard/restart walkthrough passed; see T02 Implementation Result and [verification record](docs/t02-verification.md) |
 | T03 — Onboarding and learner profile | **Executed and accepted** | 2026-08-31 | 21 full-suite tests passed; live custom-role onboarding/edit/restart walkthrough passed; see T03 Implementation Result and [verification record](docs/t03-verification.md) |
-| T04 — Deterministic first lesson loop | Not started | — | Update after T04 execution |
+| T04 — Deterministic first lesson loop | **Executed and accepted** | 2026-08-31 | 26 full-suite tests passed; live mixed-answer lesson/restart/retention walkthrough passed; see T04 Implementation Result and [verification record](docs/t04-verification.md) |
 | T05 — Evidence-based mastery and retry | Not started | — | Update after T05 execution |
 | T06 — Due-item review experience | Not started | — | Update after T06 execution |
 | T07 — Generated scenario lessons | Not started | — | Update after T07 execution |
@@ -442,6 +442,48 @@ Record before/after progress, completion metadata, idempotent submission, restar
 - Delayed retry and full SM-2 outcome rules (T05).
 - Due-item reviews and generated content.
 - Typed/sentence-production questions.
+
+### T04 Implementation Result
+
+**Execution status:** **Executed and accepted on 2026-08-31.** The deterministic lesson loop, compact user-scoped evidence, provisional schedule, migration upgrade, automated suite, live walkthrough, restart check, and content-retention audit are complete.
+
+#### Delivered implementation
+
+- Added `LearningItem`, `UserItemProgress`, `ReviewAttempt`, and `CompletedLessonMetadata` models with user ownership, foreign keys, bounded values, and uniqueness constraints.
+- Added migration `20260831_0004`, linked to the T03 profile schema, with clean-install and T03-upgrade coverage.
+- Added a validated fixture lesson containing five kanji/vocabulary/grammar targets, a workplace passage and examples, and five meaning/reading/contextual-cloze questions.
+- Added a user-scoped `LessonService` that records exposure separately, scores answers in application code, applies a conservative initial mastery/schedule update, rejects unknown questions/options, makes submissions immutable/idempotent, and gates/idempotently writes completion metadata.
+- Added Learn rendering for target-item study, objective practice, immediate result/explanation, recap, completion, and safe abandonment. Active passage/questions/feedback remain in Streamlit session state and are cleared on logout/session loss.
+- Added a Progress view for persisted exposure, correct/incorrect counts, initial mastery, next review, and latest minimal completion metadata.
+- Added stable ASCII canonical item IDs and a database audit proving that replayable lesson content is not persisted.
+
+#### Verification evidence
+
+- Full automated suite: **26 passed**.
+- Focused lesson/retention suite: **4 passed**; focused Streamlit suite: **7 passed**; focused migration suite: **2 passed**.
+- Pylance and VS Code diagnostics reported no errors in touched Python files.
+- Fresh and T03-state databases both upgraded to `20260831_0004 (head)` with no foreign-key violations.
+- Live browser walkthrough rendered all five items and all three supported question forms, submitted three correct and two incorrect answers, showed immediate feedback, completed once, and displayed the expected compact Progress rows.
+- Live SQLite inspection found five items, five progress rows, five attempts, one completion, **zero replayable-content matches**, and **zero foreign-key violations**.
+- Browser refresh cleared authentication and active lesson content; automated restart coverage restored compact progress/completion metadata without a replayable lesson session.
+- Detailed evidence is recorded in [docs/t04-verification.md](docs/t04-verification.md).
+
+#### Important findings and decisions
+
+1. T04 uses a provisional conservative policy: exposure never changes mastery; a correct answer adds `0.10` and schedules one day later; an incorrect answer adds no mastery and schedules ten minutes later. T05 replaces this with the approved versioned dimension-aware mastery and simplified SM-2 policy.
+2. Idempotency is enforced by a SHA-256 key derived from the random lesson-session ID and fixture question ID, unique per user. Repeated submissions return the original correctness/progress and cannot duplicate evidence.
+3. Active lesson content is fixture-defined application data copied into session state for the active run. Persistence contains only canonical item/category/JLPT metadata, compact correctness/form evidence, progress/schedule values, and minimal completion metadata.
+4. Canonical item IDs use ASCII semantic slugs rather than lesson expressions. This keeps identity stable while preventing an ID from duplicating question-option or lesson text in SQLite.
+5. Submitted answers remain valid evidence when a lesson is left unfinished, while completion metadata requires all five unique submissions. This implements the planning assumption for abandoned answers.
+6. T04 does not claim corrective retry, skill-dimension evidence, Again/Hard/Good/Easy outcomes, mastery attainment, or SM-2 behavior; those remain explicitly owned by T05.
+
+#### Handoff notes for T05 and later tasks
+
+- Extend `ReviewAttempt` with dimension, mapped outcome, and policy version while retaining compactness and immutable original failures; never persist stems, options, explanations, or feedback.
+- Extend `UserItemProgress` with dimension scores, consecutive-review state, interval/ease, and UTC schedule fields through a migration based on `20260831_0004`.
+- Introduce an injectable-clock golden policy suite before replacing the provisional T04 update constants.
+- Add delayed varied retries through the existing fixture/question boundary and preserve the same user/idempotency constraints.
+- Continue using application code as the sole scoring and scheduling authority. T07 model schemas must not expose writable mastery, evidence, or schedule fields.
 
 ## Task T05 — Evidence-based mastery and delayed retry
 

@@ -8,6 +8,7 @@ from sqlalchemy import Engine
 
 from .auth import AuthenticationError, AuthenticationService, RegistrationError
 from .database import check_database, create_database_engine
+from .lesson import ActiveLesson, FIXTURE_LESSON, LessonService, LessonStateError
 from .profile import (
     JapaneseLevel,
     ProfileRecord,
@@ -31,12 +32,107 @@ def render_home(profile: ProfileRecord | None = None) -> None:
     st.write("Focus tasks: " + ", ".join(profile.tasks))
     if profile.tools_domain:
         st.caption(f"Tools and domain: {profile.tools_domain}")
-    st.info("Your first personalized lesson will be available in the next increment.")
+    st.info("A deterministic workplace status-update lesson is ready on Learn.")
 
 
-def render_learn() -> None:
+def _clear_active_lesson() -> None:
+    for key in list(st.session_state):
+        if key in {"active_fixture_lesson", "lesson_answer_results"} or key.startswith(
+            "fixture_answer_"
+        ):
+            st.session_state.pop(key, None)
+
+
+def render_learn(
+    service: LessonService | None = None, user_id: int | None = None
+) -> None:
     st.title("Learn")
-    st.info("Lesson generation will be added in a later increment.")
+    if service is None or user_id is None:
+        st.info("Sign in to start a lesson.")
+        return
+
+    if "last_lesson_completion" in st.session_state:
+        st.success("Lesson completed. Your compact progress and review schedule were saved.")
+        st.session_state.pop("last_lesson_completion", None)
+
+    active = st.session_state.get("active_fixture_lesson")
+    if not isinstance(active, ActiveLesson):
+        st.subheader(FIXTURE_LESSON.title)
+        st.write("Study five workplace Japanese targets, then answer five questions.")
+        st.caption("Opening the lesson records exposure only. It does not raise mastery.")
+        if st.button("Start fixture lesson", type="primary", key="start_fixture_lesson"):
+            _clear_active_lesson()
+            st.session_state.active_fixture_lesson = service.start_fixture_lesson(
+                user_id
+            )
+            st.session_state.lesson_answer_results = {}
+            st.rerun()
+        return
+
+    lesson = active.lesson
+    st.subheader(lesson.title)
+    st.caption(f"Difficulty: {lesson.difficulty}")
+    st.write(lesson.passage)
+
+    st.subheader("Target items")
+    for item in lesson.items:
+        with st.expander(f"{item.expression} · {item.category.value}"):
+            st.write(f"Reading: {item.reading}")
+            st.write(f"Meaning: {item.meaning}")
+            st.write(f"Example: {item.example}")
+
+    st.subheader("Practice")
+    answer_results = st.session_state.setdefault("lesson_answer_results", {})
+    for number, question in enumerate(lesson.questions, start=1):
+        st.markdown(f"**{number}. {question.prompt}**")
+        st.caption(question.form.value.replace("_", " ").title())
+        answer_key = f"fixture_answer_{active.lesson_session_id}_{question.question_id}"
+        selected_answer = st.radio(
+            f"Answer for question {number}",
+            question.options,
+            index=None,
+            key=answer_key,
+            label_visibility="collapsed",
+            disabled=question.question_id in answer_results,
+        )
+        if question.question_id in answer_results:
+            if answer_results[question.question_id]:
+                st.success("Correct.")
+            else:
+                correct_answer = question.options[question.correct_option_index]
+                st.error(f"Not quite. The correct answer is {correct_answer}.")
+            st.write(question.explanation)
+        elif st.button(
+            "Submit answer", key=f"submit_{active.lesson_session_id}_{question.question_id}"
+        ):
+            if selected_answer is None:
+                st.warning("Choose an answer before submitting.")
+            else:
+                result = service.submit_answer(
+                    user_id,
+                    active.lesson_session_id,
+                    question.question_id,
+                    question.options.index(selected_answer),
+                )
+                answer_results[question.question_id] = result.is_correct
+                st.rerun()
+
+    if len(answer_results) == len(lesson.questions):
+        st.subheader("Recap")
+        st.write(lesson.recap)
+        if st.button("Complete lesson", type="primary", key="complete_fixture_lesson"):
+            try:
+                service.complete_fixture_lesson(user_id, active.lesson_session_id)
+            except LessonStateError as error:
+                st.error(str(error))
+            else:
+                _clear_active_lesson()
+                st.session_state.last_lesson_completion = True
+                st.rerun()
+
+    if st.button("Leave lesson", key="leave_fixture_lesson"):
+        _clear_active_lesson()
+        st.rerun()
 
 
 def render_translate() -> None:
@@ -44,9 +140,47 @@ def render_translate() -> None:
     st.info("Workplace translation will be added in a later increment.")
 
 
-def render_progress() -> None:
+def render_progress(
+    service: LessonService | None = None, user_id: int | None = None
+) -> None:
     st.title("Progress")
-    st.info("Progress tracking will be added in a later increment.")
+    if service is None or user_id is None:
+        st.info("Sign in to view progress.")
+        return
+    progress = service.get_progress(user_id)
+    if not progress:
+        st.info("Start the fixture lesson to create exposure and answered evidence.")
+        return
+
+    fixture_items = {item.canonical_id: item for item in FIXTURE_LESSON.items}
+    rows = []
+    for record in progress:
+        item = fixture_items.get(record.item_id)
+        rows.append(
+            {
+                "Item": item.expression if item is not None else record.item_id,
+                "Category": record.category.value,
+                "Exposures": record.exposure_count,
+                "Correct": record.correct_count,
+                "Incorrect": record.incorrect_count,
+                "Mastery": f"{record.mastery_score:.2f}",
+                "Next review": (
+                    record.next_review_at.isoformat(sep=" ", timespec="minutes")
+                    if record.next_review_at is not None
+                    else "Not scheduled"
+                ),
+            }
+        )
+    st.dataframe(rows, hide_index=True, use_container_width=True)
+    completions = service.get_completions(user_id)
+    if completions:
+        latest = completions[0]
+        st.caption(
+            f"Latest completed topic: {latest.topic_id} · {latest.difficulty} · "
+            f"{latest.completed_at.isoformat(sep=' ', timespec='minutes')}"
+        )
+    else:
+        st.caption("No completed lesson yet. Submitted answers remain valid evidence.")
 
 
 def _set_suggested_tasks(role_key: str, tasks_key: str) -> None:
@@ -249,6 +383,8 @@ def render_authentication(service: AuthenticationService) -> bool:
 
 
 def clear_authenticated_session() -> None:
+    _clear_active_lesson()
+    st.session_state.pop("last_lesson_completion", None)
     st.session_state.pop("authenticated_user_id", None)
     st.session_state.pop("authenticated_username", None)
 
@@ -279,6 +415,7 @@ def main() -> None:
 
     user_id = int(st.session_state.authenticated_user_id)
     profile_service = ProfileService(engine)
+    lesson_service = LessonService(engine)
     profile = profile_service.get_profile(user_id)
     if profile is None:
         render_profile_editor(profile_service, user_id, None)
@@ -288,6 +425,10 @@ def main() -> None:
     selected_page = st.sidebar.radio("Navigation", PAGE_RENDERERS.keys())
     if selected_page == "Home":
         render_home(profile)
+    elif selected_page == "Learn":
+        render_learn(lesson_service, user_id)
+    elif selected_page == "Progress":
+        render_progress(lesson_service, user_id)
     elif selected_page == "Profile":
         render_profile(profile_service, user_id, profile)
     else:

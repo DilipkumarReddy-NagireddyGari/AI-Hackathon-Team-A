@@ -1,6 +1,6 @@
 # Japanese Workplace Learning
 
-T03 provides a safe, local Streamlit foundation with persistent demo accounts and user-scoped learner profiles for a personalized Japanese workplace learning MVP. Learning logic and model calls are not implemented yet.
+T04 provides a safe, local Streamlit application with persistent demo accounts, user-scoped learner profiles, and a deterministic workplace lesson with compact evidence-based progress. Model calls are not implemented yet.
 
 ## Requirements
 
@@ -23,7 +23,7 @@ Start the app with one command:
 
 `.venv\Scripts\python -m streamlit run app.py`
 
-Open the URL shown by Streamlit. Register a local demo account without an email address, complete the required learner profile, then use Home, Learn, Translate, Progress, and Profile from the sidebar. The startup health panel reports only:
+Open the URL shown by Streamlit. Register a local demo account without an email address, complete the required learner profile, then open Learn to complete the fixture lesson and Progress to inspect saved evidence. The startup health panel reports only:
 
 - whether the database is ready;
 - whether SQLite foreign-key enforcement is enabled; and
@@ -47,9 +47,18 @@ It never displays setting values. If model settings are absent, all non-model pa
 - Profile values are isolated by account and remain in SQLite after sign-out or application restart.
 - Declared level remains separate from the future estimated working level. Optional placement is displayed but unavailable until T15.
 
+## Deterministic fixture lesson
+
+- Learn contains one five-item workplace status-update lesson with meaning, reading, and contextual-cloze multiple-choice questions.
+- Opening a lesson records exposure for each item but never raises mastery. A correct answer adds `0.10` initial mastery and schedules review one day later; an incorrect answer adds no mastery and schedules review ten minutes later.
+- Each question submission is immutable and idempotent for its user and lesson session. Leaving an unfinished lesson retains already submitted compact evidence but writes no completion record.
+- Progress shows user-scoped exposure, answer counts, initial mastery, next-review timestamps, and the latest minimal completion metadata.
+- Active passage, examples, questions, options, explanations, feedback, and recap exist only in Streamlit session state. SQLite stores canonical item IDs, compact answer evidence, schedule state, and topic/difficulty/item-ID completion metadata. Refresh/process loss removes active content and requires sign-in again.
+- T05 will replace the initial schedule with the versioned dimension-aware mastery and simplified SM-2 policy, including corrective delayed retries.
+
 ## Test
 
-Run all profile, authentication, startup, navigation, migration, configuration, database, and secret checks:
+Run all lesson, profile, authentication, startup, navigation, migration, retention, configuration, database, and secret checks:
 
 `.venv\Scripts\python -m pytest`
 
@@ -75,7 +84,7 @@ Model status is configured only when all four model variables are present. The c
 
 ## Database and migrations
 
-SQLite files are local and ignored by Git. Every application-created SQLite connection executes `PRAGMA foreign_keys=ON`. Alembic owns the schema, including the T02 `users` table and T03 `learner_profiles` table. Run the upgrade command after pulling schema changes and before starting the app.
+SQLite files are local and ignored by Git. Every application-created SQLite connection executes `PRAGMA foreign_keys=ON`. Alembic owns the schema, including T02 accounts, T03 learner profiles, and T04 learning items, progress, review attempts, and completion metadata. Run the upgrade command after pulling schema changes and before starting the app.
 
 Useful migration checks:
 
