@@ -35,7 +35,7 @@ This is a living execution record. After every task, update its status here and 
 | T02 — Local account access | **Executed and accepted** | 2026-08-31 | 17 full-suite tests passed; live registration/login/logout/guard/restart walkthrough passed; see T02 Implementation Result and [verification record](docs/t02-verification.md) |
 | T03 — Onboarding and learner profile | **Executed and accepted** | 2026-08-31 | 21 full-suite tests passed; live custom-role onboarding/edit/restart walkthrough passed; see T03 Implementation Result and [verification record](docs/t03-verification.md) |
 | T04 — Deterministic first lesson loop | **Executed and accepted** | 2026-08-31 | 26 full-suite tests passed; live mixed-answer lesson/restart/retention walkthrough passed; see T04 Implementation Result and [verification record](docs/t04-verification.md) |
-| T05 — Evidence-based mastery and retry | Not started | — | Update after T05 execution |
+| T05 — Evidence-based mastery and retry | **Executed** | 2026-08-31 | 29 full-suite tests passed; live all-wrong/recovery walkthrough passed; see T05 Implementation Result and [verification record](docs/t05-verification.md) |
 | T06 — Due-item review experience | Not started | — | Update after T06 execution |
 | T07 — Generated scenario lessons | Not started | — | Update after T07 execution |
 | T08 — Personalized surprise lessons | Not started | — | Update after T08 execution |
@@ -537,6 +537,45 @@ Show UI feedback plus golden evidence/schedule traces for Again, Hard, Good, and
 - LLM-written feedback quality evaluation.
 - Typed answers and free-form grading.
 - Official JLPT certification logic.
+
+### T05 Implementation Result
+
+**Execution status:** **Executed on 2026-08-31.** The deterministic policy, persisted evidence, migration, automated checks, and live product checkpoint are complete.
+
+#### Delivered implementation
+
+- Replaced the provisional T04 score update with documented policy `t05-v1`, covering recognition, reading, contextual use, grammar application, Again/Hard/Good/Easy mapping, mastery guards, consecutive successful reviews, and deterministic SM-2 interval/ease updates.
+- Added one alternate-form corrective question for every fixture question. Incorrect first attempts show immediate correction; retries appear after first-pass practice, preserve the original failure, and must be attempted before lesson completion.
+- Persisted compact dimension, outcome, retry marker, policy version, mastery, interval, ease, and consecutive-review state without persisting prompts, options, explanations, or feedback.
+- Added Alembic revision `20260831_0005`, including conservative defaults and classification of existing T04 attempt rows as `t04-provisional`.
+- Extended Progress with latest outcome, interval, ease, and consecutive successful review state.
+- Published policy constants and golden vectors in [README.md](README.md).
+
+#### Verification evidence
+
+- Full automated suite: **29 passed**; `git diff --check` passed.
+- Focused lesson policy suite: **6 passed**; clean/T04 migration suite: **2 passed**; Streamlit wrong-answer/retry acceptance path passed.
+- Clean migration and populated T04 upgrade both reached `20260831_0005 (head)` with no foreign-key violations.
+- Live browser walkthrough at `http://localhost:8502/` completed five wrong first attempts, displayed five immediate corrections, required five different-form retries, labeled each successful recovery Hard, unlocked completion, and displayed persisted Progress.
+- Live compact-evidence inspection showed five immutable Again rows plus five Hard retry rows. Each recovered item ended at mastery `0.08`, interval `1`, and ease `2.15`; the temporary verification account was then removed.
+- The retention test includes fixture and retry passages, prompts, options, explanations, examples, and recap and found none in SQLite.
+- Detailed evidence is recorded in [docs/t05-verification.md](docs/t05-verification.md).
+
+#### Important findings and decisions
+
+1. Policy `t05-v1` defines mastery as `0.80`. Non-Easy or single-form evidence is capped at `0.79`; Easy requires two prior consecutive first-try successes in separate sessions plus at least two successful forms.
+2. Again is due in ten minutes with interval zero; Hard is due in one day; Good uses 1 day, then 3 days, then interval times ease; Easy uses at least 4 days times ease times `1.3`.
+3. A recovery does not erase or downgrade the original failure. It creates a second immutable evidence row and resets the consecutive first-try-success count.
+4. Corrective practice is delayed until all first-pass fixture questions are answered. This gives a genuine intervening-question delay without introducing timers or background state.
+5. Existing T04 mastery/count data is retained, but new policy fields start conservatively and prior attempts are labeled `t04-provisional`; migration does not retroactively infer stronger mastery.
+
+#### Handoff notes for T06 and later tasks
+
+- T06 should select due items using `next_review_at <= injected_clock()` and reuse this policy service rather than writing schedule fields directly.
+- Review sessions need distinct session IDs and alternate forms so Good/Easy guards continue to use separate sessions and varied evidence correctly.
+- Limit due-item selection to five, keep new lessons available, and preserve answer idempotency for every review submission.
+- Use `last_outcome`, interval/ease, and compact dimensions for display and selection only; model-generated content must never set them.
+- Continue testing both clean migrations and upgrades from the populated `20260831_0005` database.
 
 ## Task T06 — Due-item review experience
 

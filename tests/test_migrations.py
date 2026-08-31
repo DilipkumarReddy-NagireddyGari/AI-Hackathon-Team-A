@@ -16,7 +16,7 @@ def configure_database(monkeypatch, database_path: Path) -> Config:
     return Config(str(PROJECT_ROOT / "alembic.ini"))
 
 
-def assert_t04_schema(database_path: Path) -> None:
+def assert_t05_schema(database_path: Path) -> None:
     with sqlite3.connect(database_path) as connection:
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
         user_columns = {
@@ -62,7 +62,7 @@ def assert_t04_schema(database_path: Path) -> None:
         ).fetchall()
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert revision == ("20260831_0004",)
+    assert revision == ("20260831_0005",)
     assert user_columns == {
         "id",
         "username",
@@ -104,6 +104,11 @@ def assert_t04_schema(database_path: Path) -> None:
         "correct_count",
         "incorrect_count",
         "mastery_score",
+        "dimension_scores",
+        "consecutive_successful_reviews",
+        "sm2_interval_days",
+        "sm2_ease",
+        "last_outcome",
         "last_answered_at",
         "next_review_at",
         "created_at",
@@ -116,8 +121,11 @@ def assert_t04_schema(database_path: Path) -> None:
         "lesson_session_id",
         "idempotency_key",
         "question_form",
+        "skill_dimension",
         "is_correct",
         "is_retry",
+        "outcome",
+        "policy_version",
         "answered_at",
     }
     assert completion_columns == {
@@ -143,31 +151,70 @@ def assert_t04_schema(database_path: Path) -> None:
     assert violations == []
 
 
-def test_clean_database_upgrades_to_t04_head(monkeypatch, tmp_path: Path) -> None:
+def test_clean_database_upgrades_to_t05_head(monkeypatch, tmp_path: Path) -> None:
     database_path = tmp_path / "migration.db"
     config = configure_database(monkeypatch, database_path)
 
     command.upgrade(config, "head")
 
-    assert_t04_schema(database_path)
+    assert_t05_schema(database_path)
     get_settings.cache_clear()
 
 
-def test_t03_database_upgrades_to_t04_head(monkeypatch, tmp_path: Path) -> None:
+def test_t04_database_upgrades_to_t05_head(monkeypatch, tmp_path: Path) -> None:
     database_path = tmp_path / "migration.db"
     config = configure_database(monkeypatch, database_path)
 
-    command.upgrade(config, "20260831_0003")
+    command.upgrade(config, "20260831_0004")
     with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO users (username, normalized_username, password_hash) "
+            "VALUES ('Alice', 'alice', 'test-hash')"
+        )
+        connection.execute(
+            "INSERT INTO learning_items "
+            "(canonical_id, category, jlpt_level, jlpt_provenance, jlpt_confidence) "
+            "VALUES ('grammar:test', 'grammar', 'JLPT N4', 'fixture-reference', 0.9)"
+        )
+        connection.execute(
+            "INSERT INTO user_item_progress "
+            "(user_id, item_id, correct_count, incorrect_count, mastery_score) "
+            "VALUES (1, 'grammar:test', 0, 1, 0.1)"
+        )
+        connection.execute(
+            "INSERT INTO review_attempts "
+            "(user_id, item_id, lesson_session_id, idempotency_key, question_form, "
+            "is_correct, is_retry, answered_at) VALUES "
+            "(1, 'grammar:test', '11111111-1111-1111-1111-111111111111', "
+            "'test-idempotency-key', 'contextual_cloze', 0, 0, '2026-08-31 12:00:00')"
+        )
+        connection.commit()
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-        lesson_tables = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'learning_items'"
-        ).fetchone()
+        progress_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(user_item_progress)"
+            ).fetchall()
+        }
 
-    assert revision == ("20260831_0003",)
-    assert lesson_tables is None
+    assert revision == ("20260831_0004",)
+    assert "sm2_ease" not in progress_columns
 
     command.upgrade(config, "head")
 
-    assert_t04_schema(database_path)
+    assert_t05_schema(database_path)
+    with sqlite3.connect(database_path) as connection:
+        progress_backfill = connection.execute(
+            "SELECT dimension_scores, consecutive_successful_reviews, "
+            "sm2_interval_days, sm2_ease, last_outcome FROM user_item_progress"
+        ).fetchone()
+        attempt_backfill = connection.execute(
+            "SELECT skill_dimension, outcome, policy_version FROM review_attempts"
+        ).fetchone()
+    assert progress_backfill == ("{}", 0, 0, 2.5, None)
+    assert attempt_backfill == (
+        "grammar_application",
+        "again",
+        "t04-provisional",
+    )
     get_settings.cache_clear()

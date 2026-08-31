@@ -90,6 +90,17 @@ class UserItemProgress(Base):
             "mastery_score >= 0.0 AND mastery_score <= 1.0",
             name="ck_progress_mastery_score",
         ),
+        CheckConstraint(
+            "sm2_ease >= 1.3 AND sm2_ease <= 3.0",
+            name="ck_progress_sm2_ease",
+        ),
+        CheckConstraint(
+            "sm2_interval_days >= 0", name="ck_progress_sm2_interval_days"
+        ),
+        CheckConstraint(
+            "consecutive_successful_reviews >= 0",
+            name="ck_progress_consecutive_successful_reviews",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -103,6 +114,11 @@ class UserItemProgress(Base):
     correct_count: Mapped[int] = mapped_column(Integer(), default=0)
     incorrect_count: Mapped[int] = mapped_column(Integer(), default=0)
     mastery_score: Mapped[float] = mapped_column(Float(), default=0.0)
+    dimension_scores: Mapped[dict[str, float]] = mapped_column(JSON, default=dict)
+    consecutive_successful_reviews: Mapped[int] = mapped_column(Integer(), default=0)
+    sm2_interval_days: Mapped[int] = mapped_column(Integer(), default=0)
+    sm2_ease: Mapped[float] = mapped_column(Float(), default=2.5)
+    last_outcome: Mapped[str | None] = mapped_column(String(16), nullable=True)
     last_answered_at: Mapped[datetime | None] = mapped_column(
         DateTime(), nullable=True
     )
@@ -123,6 +139,15 @@ class ReviewAttempt(Base):
             "question_form IN ('meaning', 'reading', 'contextual_cloze')",
             name="ck_attempt_question_form",
         ),
+        CheckConstraint(
+            "skill_dimension IN ('recognition', 'reading', 'contextual_use', "
+            "'grammar_application')",
+            name="ck_attempt_skill_dimension",
+        ),
+        CheckConstraint(
+            "outcome IN ('again', 'hard', 'good', 'easy')",
+            name="ck_attempt_outcome",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -135,8 +160,11 @@ class ReviewAttempt(Base):
     lesson_session_id: Mapped[str] = mapped_column(String(36), index=True)
     idempotency_key: Mapped[str] = mapped_column(String(64))
     question_form: Mapped[str] = mapped_column(String(32))
+    skill_dimension: Mapped[str] = mapped_column(String(32))
     is_correct: Mapped[bool] = mapped_column(Boolean())
     is_retry: Mapped[bool] = mapped_column(Boolean(), default=False)
+    outcome: Mapped[str] = mapped_column(String(16))
+    policy_version: Mapped[str] = mapped_column(String(16))
     answered_at: Mapped[datetime] = mapped_column(DateTime())
 
 

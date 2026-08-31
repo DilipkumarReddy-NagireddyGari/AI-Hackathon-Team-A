@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
+from math import ceil
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -29,6 +30,20 @@ class QuestionForm(StrEnum):
     MEANING = "meaning"
     READING = "reading"
     CONTEXTUAL_CLOZE = "contextual_cloze"
+
+
+class SkillDimension(StrEnum):
+    RECOGNITION = "recognition"
+    READING = "reading"
+    CONTEXTUAL_USE = "contextual_use"
+    GRAMMAR_APPLICATION = "grammar_application"
+
+
+class ReviewOutcome(StrEnum):
+    AGAIN = "again"
+    HARD = "hard"
+    GOOD = "good"
+    EASY = "easy"
 
 
 class FixtureItem(BaseModel):
@@ -204,6 +219,54 @@ FIXTURE_LESSON = FixtureLesson(
     ),
 )
 
+RETRY_QUESTIONS = {
+    "meaning-progress": FixtureQuestion(
+        question_id="retry-cloze-progress",
+        item_id="vocabulary:shinchoku",
+        form=QuestionForm.CONTEXTUAL_CLOZE,
+        prompt="Choose the project-status word: 開発の___を共有します。",
+        options=("進捗", "予算", "承認", "議題"),
+        correct_option_index=0,
+        explanation="進捗 fits because the sentence is sharing how far development has progressed.",
+    ),
+    "reading-share": FixtureQuestion(
+        question_id="retry-meaning-share",
+        item_id="vocabulary:kyouyuu",
+        form=QuestionForm.MEANING,
+        prompt="What workplace action does 情報を共有する describe?",
+        options=("Sharing information", "Approving a budget", "Delaying a meeting", "Testing a release"),
+        correct_option_index=0,
+        explanation="情報を共有する means to share information with others.",
+    ),
+    "cloze-permission": FixtureQuestion(
+        question_id="retry-meaning-permission",
+        item_id="grammar:permission-temo-yoroshii",
+        form=QuestionForm.MEANING,
+        prompt="What is the purpose of 〜てもよろしいでしょうか?",
+        options=("Politely asking permission", "Reporting a past event", "Giving a prohibition", "Comparing two choices"),
+        correct_option_index=0,
+        explanation="The pattern is a polite way to ask whether an action is permitted.",
+    ),
+    "meaning-report": FixtureQuestion(
+        question_id="retry-cloze-report",
+        item_id="vocabulary:houkoku",
+        form=QuestionForm.CONTEXTUAL_CLOZE,
+        prompt="Choose the action for a meeting update: 会議で結果を___します。",
+        options=("報告", "延期", "承認", "調査"),
+        correct_option_index=0,
+        explanation="報告します means to report the results in the meeting.",
+    ),
+    "reading-kanji-progress": FixtureQuestion(
+        question_id="retry-meaning-kanji-progress",
+        item_id="kanji:shin-progress",
+        form=QuestionForm.MEANING,
+        prompt="Which idea is associated with 進?",
+        options=("Advancing", "Stopping", "Returning", "Dividing"),
+        correct_option_index=0,
+        explanation="進 carries the idea of advancing or moving forward.",
+    ),
+}
+
 
 class LessonStateError(ValueError):
     pass
@@ -220,7 +283,10 @@ class AttemptResult:
     item_id: str
     question_id: str
     is_correct: bool
+    outcome: ReviewOutcome
     mastery_score: float
+    sm2_interval_days: int
+    sm2_ease: float
     next_review_at: datetime
     duplicate: bool
 
@@ -233,6 +299,11 @@ class ProgressRecord:
     correct_count: int
     incorrect_count: int
     mastery_score: float
+    dimension_scores: dict[str, float]
+    consecutive_successful_reviews: int
+    sm2_interval_days: int
+    sm2_ease: float
+    last_outcome: ReviewOutcome | None
     last_answered_at: datetime | None
     next_review_at: datetime | None
 
@@ -250,9 +321,21 @@ def _utc_now() -> datetime:
 
 
 class LessonService:
-    CORRECT_MASTERY_GAIN = 0.10
-    CORRECT_REVIEW_DELAY = timedelta(days=1)
-    INCORRECT_REVIEW_DELAY = timedelta(minutes=10)
+    POLICY_VERSION = "t05-v1"
+    MASTERY_THRESHOLD = 0.80
+    MASTERY_DELTAS = {
+        ReviewOutcome.AGAIN: -0.08,
+        ReviewOutcome.HARD: 0.08,
+        ReviewOutcome.GOOD: 0.18,
+        ReviewOutcome.EASY: 0.30,
+    }
+    DIMENSION_DELTAS = {
+        ReviewOutcome.AGAIN: -0.10,
+        ReviewOutcome.HARD: 0.10,
+        ReviewOutcome.GOOD: 0.20,
+        ReviewOutcome.EASY: 0.30,
+    }
+    AGAIN_REVIEW_DELAY = timedelta(minutes=10)
 
     def __init__(
         self, engine: Engine, clock: Callable[[], datetime] = _utc_now
@@ -289,22 +372,56 @@ class LessonService:
         question_id: str,
         selected_option_index: int,
     ) -> AttemptResult:
-        question = next(
-            (
-                candidate
-                for candidate in FIXTURE_LESSON.questions
-                if candidate.question_id == question_id
-            ),
-            None,
-        )
+        question = self._find_question(FIXTURE_LESSON.questions, question_id)
         if question is None:
             raise LessonStateError("This question is not part of the active lesson.")
+        return self._submit_question(
+            user_id,
+            lesson_session_id,
+            question,
+            selected_option_index,
+            is_retry=False,
+        )
+
+    def submit_retry_answer(
+        self,
+        user_id: int,
+        lesson_session_id: str,
+        question_id: str,
+        selected_option_index: int,
+    ) -> AttemptResult:
+        question = self._find_question(RETRY_QUESTIONS.values(), question_id)
+        if question is None:
+            raise LessonStateError("This retry is not part of the active lesson.")
+        pending_ids = {
+            retry.question_id
+            for retry in self.get_pending_retries(user_id, lesson_session_id)
+        }
+        if question_id not in pending_ids:
+            raise LessonStateError("This retry is not currently due.")
+        return self._submit_question(
+            user_id,
+            lesson_session_id,
+            question,
+            selected_option_index,
+            is_retry=True,
+        )
+
+    def _submit_question(
+        self,
+        user_id: int,
+        lesson_session_id: str,
+        question: FixtureQuestion,
+        selected_option_index: int,
+        *,
+        is_retry: bool,
+    ) -> AttemptResult:
         if selected_option_index not in range(len(question.options)):
             raise LessonStateError("Select one of the available answers.")
 
         now = self._clock()
         idempotency_key = sha256(
-            f"{lesson_session_id}:{question_id}".encode("utf-8")
+            f"{lesson_session_id}:{question.question_id}".encode("utf-8")
         ).hexdigest()
         with Session(self._engine) as session:
             existing = session.scalar(
@@ -315,7 +432,7 @@ class LessonService:
             )
             if existing is not None:
                 progress = self._required_progress(session, user_id, existing.item_id)
-                return self._attempt_result(existing, question_id, progress, True)
+                return self._attempt_result(existing, question.question_id, progress, True)
 
             fixture_item = next(
                 item
@@ -331,15 +448,20 @@ class LessonService:
             is_correct = selected_option_index == question.correct_option_index
             if is_correct:
                 progress.correct_count += 1
-                progress.mastery_score = min(
-                    1.0, progress.mastery_score + self.CORRECT_MASTERY_GAIN
-                )
-                review_delay = self.CORRECT_REVIEW_DELAY
             else:
                 progress.incorrect_count += 1
-                review_delay = self.INCORRECT_REVIEW_DELAY
+            historical_attempts = session.scalars(
+                select(ReviewAttempt).where(
+                    ReviewAttempt.user_id == user_id,
+                    ReviewAttempt.item_id == question.item_id,
+                )
+            ).all()
+            outcome = self._map_outcome(
+                progress, historical_attempts, question, lesson_session_id, is_correct, is_retry
+            )
+            skill_dimension = self._skill_dimension(question, fixture_item.category)
+            self._apply_policy(progress, historical_attempts, question, skill_dimension, outcome, now)
             progress.last_answered_at = now
-            progress.next_review_at = now + review_delay
 
             attempt = ReviewAttempt(
                 user_id=user_id,
@@ -347,14 +469,40 @@ class LessonService:
                 lesson_session_id=lesson_session_id,
                 idempotency_key=idempotency_key,
                 question_form=question.form.value,
+                skill_dimension=skill_dimension.value,
                 is_correct=is_correct,
-                is_retry=False,
+                is_retry=is_retry,
+                outcome=outcome.value,
+                policy_version=self.POLICY_VERSION,
                 answered_at=now,
             )
             session.add(attempt)
             session.commit()
             session.refresh(progress)
-            return self._attempt_result(attempt, question_id, progress, False)
+            return self._attempt_result(attempt, question.question_id, progress, False)
+
+    def get_pending_retries(
+        self, user_id: int, lesson_session_id: str
+    ) -> tuple[FixtureQuestion, ...]:
+        with Session(self._engine) as session:
+            attempts = session.scalars(
+                select(ReviewAttempt).where(
+                    ReviewAttempt.user_id == user_id,
+                    ReviewAttempt.lesson_session_id == lesson_session_id,
+                )
+            ).all()
+        failed_item_ids = {
+            attempt.item_id
+            for attempt in attempts
+            if not attempt.is_retry and not attempt.is_correct
+        }
+        retried_item_ids = {attempt.item_id for attempt in attempts if attempt.is_retry}
+        return tuple(
+            RETRY_QUESTIONS[question.question_id]
+            for question in FIXTURE_LESSON.questions
+            if question.item_id in failed_item_ids
+            and question.item_id not in retried_item_ids
+        )
 
     def complete_fixture_lesson(
         self, user_id: int, lesson_session_id: str
@@ -373,10 +521,13 @@ class LessonService:
                 select(func.count(ReviewAttempt.id)).where(
                     ReviewAttempt.user_id == user_id,
                     ReviewAttempt.lesson_session_id == lesson_session_id,
+                    ReviewAttempt.is_retry.is_(False),
                 )
             )
             if attempt_count != len(FIXTURE_LESSON.questions):
                 raise LessonStateError("Answer every question before completing the lesson.")
+            if self.get_pending_retries(user_id, lesson_session_id):
+                raise LessonStateError("Complete each corrective retry before finishing.")
 
             completion = CompletedLessonMetadata(
                 user_id=user_id,
@@ -409,6 +560,15 @@ class LessonService:
                     correct_count=progress.correct_count,
                     incorrect_count=progress.incorrect_count,
                     mastery_score=progress.mastery_score,
+                    dimension_scores=dict(progress.dimension_scores),
+                    consecutive_successful_reviews=progress.consecutive_successful_reviews,
+                    sm2_interval_days=progress.sm2_interval_days,
+                    sm2_ease=progress.sm2_ease,
+                    last_outcome=(
+                        ReviewOutcome(progress.last_outcome)
+                        if progress.last_outcome is not None
+                        else None
+                    ),
                     last_answered_at=progress.last_answered_at,
                     next_review_at=progress.next_review_at,
                 )
@@ -457,6 +617,124 @@ class LessonService:
         return progress
 
     @staticmethod
+    def _find_question(
+        questions: object, question_id: str
+    ) -> FixtureQuestion | None:
+        return next(
+            (
+                candidate
+                for candidate in questions
+                if isinstance(candidate, FixtureQuestion)
+                and candidate.question_id == question_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _skill_dimension(
+        question: FixtureQuestion, category: ItemCategory
+    ) -> SkillDimension:
+        if question.form is QuestionForm.READING:
+            return SkillDimension.READING
+        if question.form is QuestionForm.CONTEXTUAL_CLOZE:
+            if category is ItemCategory.GRAMMAR:
+                return SkillDimension.GRAMMAR_APPLICATION
+            return SkillDimension.CONTEXTUAL_USE
+        return SkillDimension.RECOGNITION
+
+    @staticmethod
+    def _map_outcome(
+        progress: UserItemProgress,
+        historical_attempts: list[ReviewAttempt],
+        question: FixtureQuestion,
+        lesson_session_id: str,
+        is_correct: bool,
+        is_retry: bool,
+    ) -> ReviewOutcome:
+        if not is_correct:
+            return ReviewOutcome.AGAIN
+        if is_retry:
+            return ReviewOutcome.HARD
+        successful_sessions = {
+            attempt.lesson_session_id
+            for attempt in historical_attempts
+            if attempt.is_correct
+        }
+        successful_forms = {
+            attempt.question_form
+            for attempt in historical_attempts
+            if attempt.is_correct
+        }
+        successful_forms.add(question.form.value)
+        separate_sessions = len(successful_sessions - {lesson_session_id}) >= 2
+        if (
+            progress.consecutive_successful_reviews >= 2
+            and separate_sessions
+            and len(successful_forms) >= 2
+        ):
+            return ReviewOutcome.EASY
+        return ReviewOutcome.GOOD
+
+    def _apply_policy(
+        self,
+        progress: UserItemProgress,
+        historical_attempts: list[ReviewAttempt],
+        question: FixtureQuestion,
+        skill_dimension: SkillDimension,
+        outcome: ReviewOutcome,
+        now: datetime,
+    ) -> None:
+        dimension_scores = dict(progress.dimension_scores or {})
+        current_dimension = dimension_scores.get(skill_dimension.value, 0.0)
+        dimension_scores[skill_dimension.value] = round(
+            min(1.0, max(0.0, current_dimension + self.DIMENSION_DELTAS[outcome])),
+            2,
+        )
+        progress.dimension_scores = dimension_scores
+
+        mastery = progress.mastery_score + self.MASTERY_DELTAS[outcome]
+        successful_forms = {
+            attempt.question_form
+            for attempt in historical_attempts
+            if attempt.is_correct
+        }
+        if outcome is not ReviewOutcome.AGAIN:
+            successful_forms.add(question.form.value)
+        if len(successful_forms) < 2 or outcome is not ReviewOutcome.EASY:
+            mastery = min(mastery, self.MASTERY_THRESHOLD - 0.01)
+        progress.mastery_score = round(min(1.0, max(0.0, mastery)), 2)
+
+        if outcome is ReviewOutcome.AGAIN:
+            progress.consecutive_successful_reviews = 0
+            progress.sm2_ease = round(max(1.3, progress.sm2_ease - 0.20), 2)
+            progress.sm2_interval_days = 0
+            progress.next_review_at = now + self.AGAIN_REVIEW_DELAY
+        elif outcome is ReviewOutcome.HARD:
+            progress.consecutive_successful_reviews = 0
+            progress.sm2_ease = round(max(1.3, progress.sm2_ease - 0.15), 2)
+            progress.sm2_interval_days = 1
+            progress.next_review_at = now + timedelta(days=1)
+        elif outcome is ReviewOutcome.GOOD:
+            progress.consecutive_successful_reviews += 1
+            progress.sm2_ease = round(min(3.0, progress.sm2_ease + 0.05), 2)
+            if progress.sm2_interval_days == 0:
+                progress.sm2_interval_days = 1
+            elif progress.sm2_interval_days == 1:
+                progress.sm2_interval_days = 3
+            else:
+                progress.sm2_interval_days = ceil(
+                    progress.sm2_interval_days * progress.sm2_ease
+                )
+            progress.next_review_at = now + timedelta(days=progress.sm2_interval_days)
+        else:
+            progress.consecutive_successful_reviews += 1
+            progress.sm2_ease = round(min(3.0, progress.sm2_ease + 0.15), 2)
+            base_interval = max(4, progress.sm2_interval_days)
+            progress.sm2_interval_days = ceil(base_interval * progress.sm2_ease * 1.3)
+            progress.next_review_at = now + timedelta(days=progress.sm2_interval_days)
+        progress.last_outcome = outcome.value
+
+    @staticmethod
     def _attempt_result(
         attempt: ReviewAttempt,
         question_id: str,
@@ -469,7 +747,10 @@ class LessonService:
             item_id=attempt.item_id,
             question_id=question_id,
             is_correct=attempt.is_correct,
+            outcome=ReviewOutcome(attempt.outcome),
             mastery_score=progress.mastery_score,
+            sm2_interval_days=progress.sm2_interval_days,
+            sm2_ease=progress.sm2_ease,
             next_review_at=progress.next_review_at,
             duplicate=duplicate,
         )

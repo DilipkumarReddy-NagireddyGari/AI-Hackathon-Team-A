@@ -205,3 +205,53 @@ def test_fixture_lesson_can_be_answered_completed_and_viewed_in_progress(
     assert sum(record.correct_count for record in lessons.get_progress(user.id)) == 5
     assert len(lessons.get_completions(user.id)) == 1
     engine.dispose()
+
+
+def test_incorrect_answer_shows_correction_and_requires_varied_retry(
+    monkeypatch, tmp_path: Path
+) -> None:
+    database_path = tmp_path / "app.db"
+    prepare_database(monkeypatch, database_path)
+    user = create_completed_user(database_path)
+    app = AppTest.from_file(str(PROJECT_ROOT / "app.py")).run()
+    app.session_state["authenticated_user_id"] = user.id
+    app.session_state["authenticated_username"] = user.username
+    app.run()
+
+    app.sidebar.radio[0].set_value("Learn").run()
+    app.button(key="start_fixture_lesson").click().run()
+    active = app.session_state["active_fixture_lesson"]
+    failed_question = FIXTURE_LESSON.questions[0]
+
+    for question in FIXTURE_LESSON.questions:
+        answer_key = f"fixture_answer_{active.lesson_session_id}_{question.question_id}"
+        selected_index = (
+            1
+            if question.question_id == failed_question.question_id
+            else question.correct_option_index
+        )
+        app.radio(key=answer_key).set_value(question.options[selected_index])
+        app.button(
+            key=f"submit_{active.lesson_session_id}_{question.question_id}"
+        ).click().run()
+
+    assert any("The correct answer is" in error.value for error in app.error)
+    settings = Settings(
+        database_url=f"sqlite:///{database_path.as_posix()}", _env_file=None
+    )
+    engine = create_database_engine(settings)
+    retry = LessonService(engine).get_pending_retries(
+        user.id, active.lesson_session_id
+    )[0]
+    engine.dispose()
+    assert retry.item_id == failed_question.item_id
+    assert retry.form != failed_question.form
+
+    retry_key = f"fixture_retry_{active.lesson_session_id}_{retry.question_id}"
+    app.radio(key=retry_key).set_value(retry.options[retry.correct_option_index])
+    app.button(
+        key=f"submit_retry_{active.lesson_session_id}_{retry.question_id}"
+    ).click().run()
+
+    assert any("This counts as Hard" in success.value for success in app.success)
+    assert app.button(key="complete_fixture_lesson")

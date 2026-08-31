@@ -8,7 +8,13 @@ from sqlalchemy.orm import Session
 
 from japanese_workplace_tutor.auth import AuthenticationService
 from japanese_workplace_tutor.database import create_database_engine
-from japanese_workplace_tutor.lesson import FIXTURE_LESSON, LessonService, LessonStateError
+from japanese_workplace_tutor.lesson import (
+    FIXTURE_LESSON,
+    RETRY_QUESTIONS,
+    LessonService,
+    LessonStateError,
+    ReviewOutcome,
+)
 from japanese_workplace_tutor.models import (
     Base,
     CompletedLessonMetadata,
@@ -57,9 +63,10 @@ def test_exposure_does_not_raise_mastery_and_answers_are_idempotent(
     )
 
     assert first.is_correct is True
-    assert first.mastery_score == 0.1
+    assert first.outcome is ReviewOutcome.GOOD
+    assert first.mastery_score == 0.18
     assert duplicate.is_correct is True
-    assert duplicate.mastery_score == 0.1
+    assert duplicate.mastery_score == 0.18
     assert duplicate.duplicate is True
     lessons.start_fixture_lesson(user.id)
     reopened_progress = lessons.get_progress(user.id)
@@ -67,9 +74,95 @@ def test_exposure_does_not_raise_mastery_and_answers_are_idempotent(
     answered_item = next(
         record for record in reopened_progress if record.item_id == question.item_id
     )
-    assert answered_item.mastery_score == 0.1
+    assert answered_item.mastery_score == 0.18
     with Session(engine) as session:
         assert session.scalar(select(func.count(ReviewAttempt.id))) == 1
+    engine.dispose()
+
+
+def test_again_and_varied_retry_preserve_compact_hard_recovery(
+    tmp_path: Path,
+) -> None:
+    auth, lessons, engine = create_services(tmp_path / "lesson.db")
+    user = auth.register("Alice", "correct horse battery staple")
+    active = lessons.start_fixture_lesson(user.id, "11111111-1111-1111-1111-111111111111")
+    question = FIXTURE_LESSON.questions[0]
+
+    failed = lessons.submit_answer(
+        user.id, active.lesson_session_id, question.question_id, 1
+    )
+    retry = lessons.get_pending_retries(user.id, active.lesson_session_id)[0]
+    recovered = lessons.submit_retry_answer(
+        user.id,
+        active.lesson_session_id,
+        retry.question_id,
+        retry.correct_option_index,
+    )
+
+    assert failed.outcome is ReviewOutcome.AGAIN
+    assert failed.mastery_score == 0.0
+    assert failed.sm2_interval_days == 0
+    assert failed.next_review_at == NOW.replace() + lessons.AGAIN_REVIEW_DELAY
+    assert retry.item_id == question.item_id
+    assert retry.form != question.form
+    assert retry.prompt != question.prompt
+    assert recovered.outcome is ReviewOutcome.HARD
+    assert recovered.mastery_score == 0.08
+    assert recovered.sm2_interval_days == 1
+    assert recovered.sm2_ease == 2.15
+    assert lessons.get_pending_retries(user.id, active.lesson_session_id) == ()
+
+    with Session(engine) as session:
+        attempts = session.scalars(select(ReviewAttempt).order_by(ReviewAttempt.id)).all()
+        assert [(row.outcome, row.is_retry) for row in attempts] == [
+            ("again", False),
+            ("hard", True),
+        ]
+        assert attempts[0].question_form != attempts[1].question_form
+        assert all(row.policy_version == "t05-v1" for row in attempts)
+    engine.dispose()
+
+
+def test_easy_requires_varied_success_across_separate_sessions(tmp_path: Path) -> None:
+    auth, lessons, engine = create_services(tmp_path / "lesson.db")
+    user = auth.register("Alice", "correct horse battery staple")
+    question = FIXTURE_LESSON.questions[0]
+
+    first = lessons.start_fixture_lesson(user.id, "11111111-1111-1111-1111-111111111111")
+    lessons.submit_answer(user.id, first.lesson_session_id, question.question_id, 1)
+    retry = lessons.get_pending_retries(user.id, first.lesson_session_id)[0]
+    lessons.submit_retry_answer(
+        user.id, first.lesson_session_id, retry.question_id, retry.correct_option_index
+    )
+
+    outcomes = []
+    for session_number in range(2, 6):
+        active = lessons.start_fixture_lesson(
+            user.id, f"{session_number:08d}-1111-1111-1111-111111111111"
+        )
+        result = lessons.submit_answer(
+            user.id,
+            active.lesson_session_id,
+            question.question_id,
+            question.correct_option_index,
+        )
+        outcomes.append(result.outcome)
+
+    assert outcomes == [
+        ReviewOutcome.GOOD,
+        ReviewOutcome.GOOD,
+        ReviewOutcome.EASY,
+        ReviewOutcome.EASY,
+    ]
+    progress = next(
+        record for record in lessons.get_progress(user.id) if record.item_id == question.item_id
+    )
+    assert progress.mastery_score == 1.0
+    assert progress.last_outcome is ReviewOutcome.EASY
+    assert progress.consecutive_successful_reviews == 4
+    assert set(progress.dimension_scores) == {"recognition", "contextual_use"}
+    assert progress.sm2_interval_days == 73
+    assert progress.sm2_ease == 2.55
     engine.dispose()
 
 
@@ -89,6 +182,13 @@ def test_mixed_answers_create_compact_progress_and_one_completion(
         lessons.submit_answer(
             user.id, active.lesson_session_id, question.question_id, selected
         )
+    for retry in lessons.get_pending_retries(user.id, active.lesson_session_id):
+        lessons.submit_retry_answer(
+            user.id,
+            active.lesson_session_id,
+            retry.question_id,
+            retry.correct_option_index,
+        )
 
     completion = lessons.complete_fixture_lesson(user.id, active.lesson_session_id)
     duplicate = lessons.complete_fixture_lesson(user.id, active.lesson_session_id)
@@ -100,10 +200,10 @@ def test_mixed_answers_create_compact_progress_and_one_completion(
     assert completion.studied_item_ids == tuple(
         item.canonical_id for item in FIXTURE_LESSON.items
     )
-    assert sum(record.correct_count for record in progress) == 3
+    assert sum(record.correct_count for record in progress) == 5
     assert sum(record.incorrect_count for record in progress) == 2
     with Session(engine) as session:
-        assert session.scalar(select(func.count(ReviewAttempt.id))) == 5
+        assert session.scalar(select(func.count(ReviewAttempt.id))) == 7
         assert session.scalar(select(func.count(CompletedLessonMetadata.id))) == 1
     engine.dispose()
 
@@ -159,6 +259,9 @@ def test_database_excludes_replayable_fixture_content(tmp_path: Path) -> None:
     for question in FIXTURE_LESSON.questions:
         prohibited_content.extend((question.prompt, question.explanation))
         prohibited_content.extend(question.options)
+    for retry in RETRY_QUESTIONS.values():
+        prohibited_content.extend((retry.prompt, retry.explanation))
+        prohibited_content.extend(retry.options)
 
     leaked_content = [
         content for content in prohibited_content if content in database_dump

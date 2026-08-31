@@ -1,6 +1,6 @@
 # Japanese Workplace Learning
 
-T04 provides a safe, local Streamlit application with persistent demo accounts, user-scoped learner profiles, and a deterministic workplace lesson with compact evidence-based progress. Model calls are not implemented yet.
+T05 provides a safe, local Streamlit application with persistent demo accounts, user-scoped learner profiles, and a deterministic workplace lesson with compact evidence-based mastery and spaced review. Model calls are not implemented yet.
 
 ## Requirements
 
@@ -50,11 +50,21 @@ It never displays setting values. If model settings are absent, all non-model pa
 ## Deterministic fixture lesson
 
 - Learn contains one five-item workplace status-update lesson with meaning, reading, and contextual-cloze multiple-choice questions.
-- Opening a lesson records exposure for each item but never raises mastery. A correct answer adds `0.10` initial mastery and schedules review one day later; an incorrect answer adds no mastery and schedules review ten minutes later.
+- Opening a lesson records exposure for each item but never raises mastery. Incorrect answers show immediate correction and schedule an alternate-form question for the same canonical item after the other first attempts.
 - Each question submission is immutable and idempotent for its user and lesson session. Leaving an unfinished lesson retains already submitted compact evidence but writes no completion record.
-- Progress shows user-scoped exposure, answer counts, initial mastery, next-review timestamps, and the latest minimal completion metadata.
+- Progress shows user-scoped exposure, answer counts, overall mastery, latest outcome, SM-2 interval/ease, consecutive successful reviews, next-review timestamps, and the latest minimal completion metadata.
 - Active passage, examples, questions, options, explanations, feedback, and recap exist only in Streamlit session state. SQLite stores canonical item IDs, compact answer evidence, schedule state, and topic/difficulty/item-ID completion metadata. Refresh/process loss removes active content and requires sign-in again.
-- T05 will replace the initial schedule with the versioned dimension-aware mastery and simplified SM-2 policy, including corrective delayed retries.
+
+### Mastery policy `t05-v1`
+
+- Evidence dimensions are recognition, reading, contextual use, and grammar application. Full question text and feedback are never persisted.
+- `Again` is an incorrect answer: mastery changes by `-0.08` to a floor of `0`, ease drops by `0.20`, the interval resets to `0`, and review is due in 10 minutes.
+- `Hard` is a correct alternate-form retry after failure: mastery changes by `+0.08`, ease drops by `0.15`, and review is due in one day. The original `Again` row remains immutable.
+- `Good` is a first-try success: mastery changes by `+0.18`, ease rises by `0.05`, and intervals progress from 1 day to 3 days, then multiply by ease.
+- `Easy` changes mastery by `+0.30`, raises ease by `0.15`, and multiplies a minimum 4-day interval by ease and `1.3`. It requires at least two preceding consecutive first-try successes in separate sessions and successful evidence from at least two question forms.
+- Mastery is `0.80`. Non-Easy evidence and evidence from only one form are capped at `0.79`, so one response, one session, or repeated same-form guesses cannot master an item.
+
+Golden vectors from an initial ease of `2.50`: `Again` gives mastery/ease/interval `0.00/2.30/0`; recovery `Hard` gives `0.08/2.15/1`. Two later `Good` sessions followed by two eligible `Easy` sessions produce mastery `0.08 → 0.26 → 0.44 → 0.74 → 1.00`, ease `2.15 → 2.20 → 2.25 → 2.40 → 2.55`, and intervals `1 → 3 → 7 → 22 → 73` days.
 
 ## Test
 
@@ -84,7 +94,7 @@ Model status is configured only when all four model variables are present. The c
 
 ## Database and migrations
 
-SQLite files are local and ignored by Git. Every application-created SQLite connection executes `PRAGMA foreign_keys=ON`. Alembic owns the schema, including T02 accounts, T03 learner profiles, and T04 learning items, progress, review attempts, and completion metadata. Run the upgrade command after pulling schema changes and before starting the app.
+SQLite files are local and ignored by Git. Every application-created SQLite connection executes `PRAGMA foreign_keys=ON`. Alembic owns the schema, including T02 accounts, T03 learner profiles, T04 learning records, and T05 dimension/mastery/SM-2 evidence. Run the upgrade command after pulling schema changes and before starting the app.
 
 Useful migration checks:
 

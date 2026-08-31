@@ -8,7 +8,13 @@ from sqlalchemy import Engine
 
 from .auth import AuthenticationError, AuthenticationService, RegistrationError
 from .database import check_database, create_database_engine
-from .lesson import ActiveLesson, FIXTURE_LESSON, LessonService, LessonStateError
+from .lesson import (
+    ActiveLesson,
+    FIXTURE_LESSON,
+    RETRY_QUESTIONS,
+    LessonService,
+    LessonStateError,
+)
 from .profile import (
     JapaneseLevel,
     ProfileRecord,
@@ -37,9 +43,11 @@ def render_home(profile: ProfileRecord | None = None) -> None:
 
 def _clear_active_lesson() -> None:
     for key in list(st.session_state):
-        if key in {"active_fixture_lesson", "lesson_answer_results"} or key.startswith(
-            "fixture_answer_"
-        ):
+        if key in {
+            "active_fixture_lesson",
+            "lesson_answer_results",
+            "lesson_retry_results",
+        } or key.startswith(("fixture_answer_", "fixture_retry_")):
             st.session_state.pop(key, None)
 
 
@@ -66,6 +74,7 @@ def render_learn(
                 user_id
             )
             st.session_state.lesson_answer_results = {}
+            st.session_state.lesson_retry_results = {}
             st.rerun()
         return
 
@@ -118,6 +127,62 @@ def render_learn(
                 st.rerun()
 
     if len(answer_results) == len(lesson.questions):
+        required_retries = [
+            RETRY_QUESTIONS[question.question_id]
+            for question in lesson.questions
+            if answer_results.get(question.question_id) is False
+        ]
+        retry_results = st.session_state.setdefault("lesson_retry_results", {})
+        if required_retries:
+            st.subheader("Corrective practice")
+            st.caption(
+                "These alternate question forms revisit concepts missed earlier. "
+                "Recovery is stored separately from the original answer."
+            )
+        for number, retry in enumerate(required_retries, start=1):
+            st.markdown(f"**Retry {number}. {retry.prompt}**")
+            st.caption(retry.form.value.replace("_", " ").title())
+            retry_key = f"fixture_retry_{active.lesson_session_id}_{retry.question_id}"
+            selected_retry = st.radio(
+                f"Answer for retry {number}",
+                retry.options,
+                index=None,
+                key=retry_key,
+                label_visibility="collapsed",
+                disabled=retry.question_id in retry_results,
+            )
+            if retry.question_id in retry_results:
+                if retry_results[retry.question_id]:
+                    st.success("Recovered. This counts as Hard, not a first-try success.")
+                else:
+                    correct_answer = retry.options[retry.correct_option_index]
+                    st.error(f"Not quite. The correct answer is {correct_answer}.")
+                st.write(retry.explanation)
+            elif st.button(
+                "Submit retry",
+                key=f"submit_retry_{active.lesson_session_id}_{retry.question_id}",
+            ):
+                if selected_retry is None:
+                    st.warning("Choose an answer before submitting.")
+                else:
+                    result = service.submit_retry_answer(
+                        user_id,
+                        active.lesson_session_id,
+                        retry.question_id,
+                        retry.options.index(selected_retry),
+                    )
+                    retry_results[retry.question_id] = result.is_correct
+                    st.rerun()
+
+    required_retry_count = sum(
+        answer_results.get(question.question_id) is False
+        for question in lesson.questions
+    )
+    completed_retry_count = len(st.session_state.get("lesson_retry_results", {}))
+    if (
+        len(answer_results) == len(lesson.questions)
+        and completed_retry_count == required_retry_count
+    ):
         st.subheader("Recap")
         st.write(lesson.recap)
         if st.button("Complete lesson", type="primary", key="complete_fixture_lesson"):
@@ -164,6 +229,14 @@ def render_progress(
                 "Correct": record.correct_count,
                 "Incorrect": record.incorrect_count,
                 "Mastery": f"{record.mastery_score:.2f}",
+                "Outcome": (
+                    record.last_outcome.value.title()
+                    if record.last_outcome is not None
+                    else "No answers"
+                ),
+                "Interval": f"{record.sm2_interval_days} days",
+                "Ease": f"{record.sm2_ease:.2f}",
+                "Successful reviews": record.consecutive_successful_reviews,
                 "Next review": (
                     record.next_review_at.isoformat(sep=" ", timespec="minutes")
                     if record.next_review_at is not None
