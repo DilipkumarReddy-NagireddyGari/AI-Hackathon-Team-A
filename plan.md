@@ -33,7 +33,7 @@ This is a living execution record. After every task, update its status here and 
 |---|---|---:|---|
 | T01 — Secure runnable foundation | **Executed and accepted** | 2026-08-28 | 10 full-suite tests passed; focused secret scan passed; five-page live smoke test passed; see T01 Implementation Result and [verification record](docs/t01-verification.md) |
 | T02 — Local account access | **Executed and accepted** | 2026-08-31 | 17 full-suite tests passed; live registration/login/logout/guard/restart walkthrough passed; see T02 Implementation Result and [verification record](docs/t02-verification.md) |
-| T03 — Onboarding and learner profile | Not started | — | Update after T03 execution |
+| T03 — Onboarding and learner profile | **Executed and accepted** | 2026-08-31 | 21 full-suite tests passed; live custom-role onboarding/edit/restart walkthrough passed; see T03 Implementation Result and [verification record](docs/t03-verification.md) |
 | T04 — Deterministic first lesson loop | Not started | — | Update after T04 execution |
 | T05 — Evidence-based mastery and retry | Not started | — | Update after T05 execution |
 | T06 — Due-item review experience | Not started | — | Update after T06 execution |
@@ -350,6 +350,45 @@ Show required validation, role search/free text, task chips, persisted profile, 
 - Placement questions and level estimation.
 - Progress reset/account deletion.
 - LLM-generated role suggestions.
+
+### T03 Implementation Result
+
+**Execution status:** **Executed and accepted on 2026-08-31.** The persistent onboarding flow, user-scoped profile editor, personalized Home state, migration upgrade, automated suite, and live restart walkthrough are complete.
+
+#### Delivered implementation
+
+- Added a one-to-one `learner_profiles` table owned by `users.id`, with structured typical tasks, optional tools/domain, separate declared and estimated levels, level source/confidence, romaji preference, and operational timestamps.
+- Added Pydantic-validated profile input and a user-scoped `ProfileService` for profile creation, lookup, and updates. Text is NFKC-normalized, control characters are rejected, tasks are trimmed and deduplicated, and every query is constrained by the authenticated user ID.
+- Added searchable common-role suggestions that accept unrestricted custom roles, plus removable and extensible task suggestions. Role suggestions remain local UI assistance rather than a stored taxonomy.
+- Added mandatory first-login onboarding, editable Profile controls, a visibly unavailable placement control for T15, and a personalized Home summary using the saved role, tasks, optional domain, and declared level.
+- Added migration `20260831_0003`, linked to the T02 account schema, with unique ownership, cascading deletion, allowed-level/source checks, and bounded confidence.
+- Added focused service, Streamlit, and migration tests for validation, isolation, free-text persistence, profile editing, declared/estimated level independence, sign-out/login restoration, clean installation, and T02 upgrade.
+
+#### Verification evidence
+
+- Full automated suite: **21 passed**.
+- Focused profile service suite: **3 passed**; focused Streamlit suite: **6 passed**; focused migration suite: **2 passed**.
+- Focused repository/notebook secret scan: **1 passed**.
+- Fresh and T02-state databases both upgraded to `20260831_0003 (head)` with the expected profile ownership and no foreign-key violations.
+- Live browser walkthrough created a custom `Solutions architect` profile, replaced suggested tasks with two edited tasks, saved an optional domain and `JLPT N4`, changed only the declared level to `JLPT N3`, and restored the complete profile after sign-out/sign-in.
+- After a full Streamlit process restart, authentication was cleared as designed; signing in returned directly to personalized Home with the persisted `JLPT N3` profile.
+- Detailed evidence is recorded in [docs/t03-verification.md](docs/t03-verification.md).
+
+#### Important findings and decisions
+
+1. Typical tasks are stored as a JSON array on the one-to-one profile row. T03 always reads and replaces the small ordered set as one validated unit; a separate task table would add joins and ordering logic without a current independent task identity or lifecycle.
+2. Declared level updates intentionally do not write `estimated_working_level`, `level_source`, or `level_confidence`. T15 can add placement-specific mutation without changing the learner-owned declared value.
+3. Profile inputs accept free-text roles and tasks after NFKC normalization. Suggestions are a local deterministic mapping and never constrain persisted values or require a model call.
+4. First-time authenticated users cannot reach protected navigation until required onboarding fields are valid. Completed users return to Home, and Profile uses the authenticated session user ID rather than an editable owner value.
+5. Romaji preference defaults off but can be enabled at any level. Presentation behavior remains owned by T09.
+
+#### Handoff notes for T04 and later tasks
+
+- Use `ProfileService.get_profile(authenticated_user_id)` as the personalization boundary; do not query profile rows by role, username, or client-supplied owner IDs.
+- T04 fixture lessons may read role, tasks, tools/domain, declared level, and romaji preference, but must not mutate profile level state or infer mastery from those values.
+- Keep lesson content and questions out of profile persistence. New user-owned learning records must retain the same non-null foreign-key ownership and user-scoped service pattern.
+- T15 should introduce an explicit service operation for estimated-level changes and preserve declared level exactly as T03 does.
+- Logout must clear future in-session lesson/document state in addition to the existing authenticated identity.
 
 ## Task T04 — Deterministic first lesson loop
 

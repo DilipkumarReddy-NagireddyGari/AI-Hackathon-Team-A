@@ -1,6 +1,6 @@
 # Japanese Workplace Learning
 
-T02 provides a safe, local Streamlit foundation with persistent demo accounts for a personalized Japanese workplace learning MVP. Learning logic and model calls are not implemented yet.
+T03 provides a safe, local Streamlit foundation with persistent demo accounts and user-scoped learner profiles for a personalized Japanese workplace learning MVP. Learning logic and model calls are not implemented yet.
 
 ## Requirements
 
@@ -23,7 +23,7 @@ Start the app with one command:
 
 `.venv\Scripts\python -m streamlit run app.py`
 
-Open the URL shown by Streamlit. Register a local demo account without an email address, then use Home, Learn, Translate, Progress, and Profile from the sidebar. The startup health panel reports only:
+Open the URL shown by Streamlit. Register a local demo account without an email address, complete the required learner profile, then use Home, Learn, Translate, Progress, and Profile from the sidebar. The startup health panel reports only:
 
 - whether the database is ready;
 - whether SQLite foreign-key enforcement is enabled; and
@@ -39,9 +39,17 @@ It never displays setting values. If model settings are absent, all non-model pa
 - Accounts remain in SQLite after restart. Authentication is held only in Streamlit session state, so a lost session or application restart requires signing in again.
 - This local mechanism is demo authentication, not enterprise identity. It has no shared/default credentials, email, recovery, SSO, or account lockout.
 
+## Learner profile
+
+- First sign-in requires a role or title, at least one typical task, and a self-reported level before protected navigation is available.
+- Role and task suggestions are searchable, editable starting points. Custom roles and tasks are accepted.
+- Technologies, tools, or business domain are optional. Romaji support defaults off.
+- Profile values are isolated by account and remain in SQLite after sign-out or application restart.
+- Declared level remains separate from the future estimated working level. Optional placement is displayed but unavailable until T15.
+
 ## Test
 
-Run all authentication, startup, navigation, migration, configuration, database, and secret checks:
+Run all profile, authentication, startup, navigation, migration, configuration, database, and secret checks:
 
 `.venv\Scripts\python -m pytest`
 
@@ -67,7 +75,7 @@ Model status is configured only when all four model variables are present. The c
 
 ## Database and migrations
 
-SQLite files are local and ignored by Git. Every application-created SQLite connection executes `PRAGMA foreign_keys=ON`. Alembic owns the schema, including the T02 `users` table. Run the upgrade command after pulling schema changes and before starting the app.
+SQLite files are local and ignored by Git. Every application-created SQLite connection executes `PRAGMA foreign_keys=ON`. Alembic owns the schema, including the T02 `users` table and T03 `learner_profiles` table. Run the upgrade command after pulling schema changes and before starting the app.
 
 Useful migration checks:
 

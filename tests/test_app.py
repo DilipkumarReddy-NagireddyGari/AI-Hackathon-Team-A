@@ -4,8 +4,11 @@ from alembic import command
 from alembic.config import Config
 from streamlit.testing.v1 import AppTest
 
+from japanese_workplace_tutor.auth import AuthenticationService
 from japanese_workplace_tutor.app import PAGE_RENDERERS
-from japanese_workplace_tutor.settings import get_settings
+from japanese_workplace_tutor.database import create_database_engine
+from japanese_workplace_tutor.profile import JapaneseLevel, ProfileService
+from japanese_workplace_tutor.settings import Settings, get_settings
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +19,24 @@ def prepare_database(monkeypatch, database_path: Path) -> None:
     get_settings.cache_clear()
     command.upgrade(Config(str(PROJECT_ROOT / "alembic.ini")), "head")
     get_settings.cache_clear()
+
+
+def create_completed_user(database_path: Path):
+    settings = Settings(
+        database_url=f"sqlite:///{database_path.as_posix()}", _env_file=None
+    )
+    engine = create_database_engine(settings)
+    user = AuthenticationService(engine).register(
+        "Alice", "correct horse battery staple"
+    )
+    ProfileService(engine).create_profile(
+        user.id,
+        role="Software engineer",
+        tasks=["Discuss requirements", "Give status updates"],
+        declared_level=JapaneseLevel.N4,
+    )
+    engine.dispose()
+    return user
 
 
 def test_all_required_pages_are_registered() -> None:
@@ -56,10 +77,12 @@ def test_dummy_model_configuration_changes_status_without_provider_call(monkeypa
 
 
 def test_each_page_opens_without_exception(monkeypatch, tmp_path: Path) -> None:
-    prepare_database(monkeypatch, tmp_path / "app.db")
+    database_path = tmp_path / "app.db"
+    prepare_database(monkeypatch, database_path)
+    user = create_completed_user(database_path)
     app = AppTest.from_file(str(PROJECT_ROOT / "app.py")).run()
-    app.session_state["authenticated_user_id"] = 1
-    app.session_state["authenticated_username"] = "Alice"
+    app.session_state["authenticated_user_id"] = user.id
+    app.session_state["authenticated_username"] = user.username
     app.run()
 
     for page_name in PAGE_RENDERERS:
@@ -76,8 +99,13 @@ def test_register_logout_and_login_flow(monkeypatch, tmp_path: Path) -> None:
     app.text_input(key="registration_password").input("correct horse battery staple")
     app.button(key="FormSubmitter:registration_form-Create account").click().run()
 
+    assert any(title.value == "Set up your learner profile" for title in app.title)
+    assert not app.sidebar.radio
+
+    app.button(key="onboarding_1_submit").click().run()
     assert any(title.value == "Home" for title in app.title)
     assert app.session_state["authenticated_username"] == "Alice"
+    assert any("Software engineer" in subheader.value for subheader in app.subheader)
 
     app.sidebar.button[0].click().run()
     assert any(title.value == "Demo authentication" for title in app.title)
@@ -89,3 +117,46 @@ def test_register_logout_and_login_flow(monkeypatch, tmp_path: Path) -> None:
 
     assert any(title.value == "Home" for title in app.title)
     assert app.session_state["authenticated_username"] == "Alice"
+
+
+def test_onboarding_validates_tasks_and_profile_can_be_edited(
+    monkeypatch, tmp_path: Path
+) -> None:
+    database_path = tmp_path / "app.db"
+    prepare_database(monkeypatch, database_path)
+    app = AppTest.from_file(str(PROJECT_ROOT / "app.py")).run()
+
+    app.text_input(key="registration_username").input("Alice")
+    app.text_input(key="registration_password").input("correct horse battery staple")
+    app.button(key="FormSubmitter:registration_form-Create account").click().run()
+
+    app.multiselect(key="onboarding_1_tasks").set_value([])
+    app.button(key="onboarding_1_submit").click().run()
+    assert any("at least one typical task" in error.value for error in app.error)
+
+    app.selectbox(key="onboarding_1_role").set_value("Researcher").run()
+    app.multiselect(key="onboarding_1_tasks").set_value(
+        ["Review applications", "Meet inventors"]
+    )
+    app.selectbox(key="onboarding_1_declared_level").set_value("JLPT N5")
+    app.button(key="onboarding_1_submit").click().run()
+
+    assert any(title.value == "Home" for title in app.title)
+    assert any("Researcher" in subheader.value for subheader in app.subheader)
+
+    app.sidebar.radio[0].set_value("Profile").run()
+    app.selectbox(key="profile_1_declared_level").set_value("JLPT N3")
+    app.text_area(key="profile_1_tools_domain").input("Intellectual property")
+    app.button(key="profile_1_submit").click().run()
+
+    assert any(success.value == "Profile saved." for success in app.success)
+    stored = ProfileService(
+        create_database_engine(
+            Settings(
+                database_url=f"sqlite:///{database_path.as_posix()}", _env_file=None
+            )
+        )
+    ).get_profile(1)
+    assert stored is not None
+    assert stored.declared_level is JapaneseLevel.N3
+    assert stored.tools_domain == "Intellectual property"

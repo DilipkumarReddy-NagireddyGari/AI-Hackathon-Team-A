@@ -8,16 +8,30 @@ from sqlalchemy import Engine
 
 from .auth import AuthenticationError, AuthenticationService, RegistrationError
 from .database import check_database, create_database_engine
+from .profile import (
+    JapaneseLevel,
+    ProfileRecord,
+    ProfileService,
+    ProfileValidationError,
+    ROLE_TASK_SUGGESTIONS,
+)
 from .settings import Settings, get_settings
 
 PageRenderer = Callable[[], None]
 
 
-def render_home() -> None:
+def render_home(profile: ProfileRecord | None = None) -> None:
     st.title("Home")
     username = st.session_state.get("authenticated_username")
     st.write(f"Welcome, {username}.")
-    st.info("Your personalized Japanese workplace learning home will appear here.")
+    if profile is None:
+        st.info("Complete your learner profile to personalize your learning.")
+        return
+    st.subheader(f"{profile.role} · {profile.declared_level.value}")
+    st.write("Focus tasks: " + ", ".join(profile.tasks))
+    if profile.tools_domain:
+        st.caption(f"Tools and domain: {profile.tools_domain}")
+    st.info("Your first personalized lesson will be available in the next increment.")
 
 
 def render_learn() -> None:
@@ -35,9 +49,131 @@ def render_progress() -> None:
     st.info("Progress tracking will be added in a later increment.")
 
 
-def render_profile() -> None:
-    st.title("Profile")
-    st.info("Learner profiles will be added in a later increment.")
+def _set_suggested_tasks(role_key: str, tasks_key: str) -> None:
+    selected_role = st.session_state.get(role_key, "")
+    st.session_state[tasks_key] = list(ROLE_TASK_SUGGESTIONS.get(selected_role, ()))
+
+
+def render_profile_editor(
+    service: ProfileService,
+    user_id: int,
+    profile: ProfileRecord | None,
+) -> None:
+    onboarding = profile is None
+    prefix = f"{'onboarding' if onboarding else 'profile'}_{user_id}"
+    role_key = f"{prefix}_role"
+    tasks_key = f"{prefix}_tasks"
+
+    if onboarding:
+        st.title("Set up your learner profile")
+        st.write("Tell us about your work so lessons can match your day-to-day needs.")
+    else:
+        st.title("Profile")
+        st.caption("Update the details used to personalize future lessons.")
+
+    role_options = list(ROLE_TASK_SUGGESTIONS)
+    if profile is not None and profile.role not in role_options:
+        role_options.insert(0, profile.role)
+    selected_role = st.selectbox(
+        "Role or title",
+        role_options,
+        index=role_options.index(profile.role) if profile is not None else 0,
+        accept_new_options=True,
+        key=role_key,
+        help="Search common roles or enter your own.",
+        on_change=(
+            _set_suggested_tasks
+            if onboarding
+            else None
+        ),
+        args=(role_key, tasks_key) if onboarding else None,
+    )
+
+    suggested_tasks = list(ROLE_TASK_SUGGESTIONS.get(selected_role, ()))
+    selected_tasks = list(profile.tasks) if profile is not None else suggested_tasks
+    task_options = list(dict.fromkeys([*selected_tasks, *suggested_tasks]))
+    tasks = st.multiselect(
+        "Typical tasks",
+        task_options,
+        default=None if tasks_key in st.session_state else selected_tasks,
+        accept_new_options=True,
+        key=tasks_key,
+        help="Remove suggestions that do not fit, or enter edited and additional tasks.",
+    )
+    tools_domain = st.text_area(
+        "Technologies, tools, or business domain (optional)",
+        value=profile.tools_domain or "" if profile is not None else "",
+        max_chars=2000,
+        key=f"{prefix}_tools_domain",
+    )
+    level_values = [level.value for level in JapaneseLevel]
+    declared_level = st.selectbox(
+        "Self-reported Japanese level",
+        level_values,
+        index=(
+            level_values.index(profile.declared_level.value)
+            if profile is not None
+            else 0
+        ),
+        key=f"{prefix}_declared_level",
+    )
+    romaji_preference = st.toggle(
+        "Show romaji support",
+        value=profile.romaji_preference if profile is not None else False,
+        key=f"{prefix}_romaji",
+        help="Optional reading support, especially for complete beginners.",
+    )
+
+    if profile is None or profile.estimated_working_level is None:
+        st.caption("Estimated working level: Not set")
+    else:
+        st.caption(f"Estimated working level: {profile.estimated_working_level.value}")
+    st.button(
+        "Take optional placement",
+        disabled=True,
+        help="Optional placement will be available in a later increment.",
+        key=f"{prefix}_placement",
+    )
+
+    submit_label = "Save profile" if onboarding else "Save changes"
+    if st.button(submit_label, type="primary", key=f"{prefix}_submit"):
+        try:
+            if onboarding:
+                service.create_profile(
+                    user_id,
+                    role=selected_role,
+                    tasks=tasks,
+                    tools_domain=tools_domain,
+                    declared_level=declared_level,
+                    romaji_preference=romaji_preference,
+                )
+            else:
+                service.update_profile(
+                    user_id,
+                    role=selected_role,
+                    tasks=tasks,
+                    tools_domain=tools_domain,
+                    declared_level=declared_level,
+                    romaji_preference=romaji_preference,
+                )
+        except ProfileValidationError as error:
+            st.error(str(error))
+        else:
+            if onboarding:
+                st.rerun()
+            st.success("Profile saved.")
+
+
+def render_profile(
+    service: ProfileService | None = None,
+    user_id: int | None = None,
+    profile: ProfileRecord | None = None,
+) -> None:
+    if service is None or user_id is None:
+        st.title("Profile")
+        st.info("Sign in to view your learner profile.")
+        return
+    render_profile_editor(service, user_id, profile)
 
 
 PAGE_RENDERERS: dict[str, PageRenderer] = {
@@ -141,8 +277,21 @@ def main() -> None:
         engine.dispose()
         st.rerun()
 
+    user_id = int(st.session_state.authenticated_user_id)
+    profile_service = ProfileService(engine)
+    profile = profile_service.get_profile(user_id)
+    if profile is None:
+        render_profile_editor(profile_service, user_id, None)
+        engine.dispose()
+        return
+
     selected_page = st.sidebar.radio("Navigation", PAGE_RENDERERS.keys())
-    PAGE_RENDERERS[selected_page]()
+    if selected_page == "Home":
+        render_home(profile)
+    elif selected_page == "Profile":
+        render_profile(profile_service, user_id, profile)
+    else:
+        PAGE_RENDERERS[selected_page]()
     engine.dispose()
 
 
