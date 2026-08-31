@@ -32,7 +32,7 @@ This is a living execution record. After every task, update its status here and 
 | Task | Status | Last verified | Result/evidence |
 |---|---|---:|---|
 | T01 — Secure runnable foundation | **Executed and accepted** | 2026-08-28 | 10 full-suite tests passed; focused secret scan passed; five-page live smoke test passed; see T01 Implementation Result and [verification record](docs/t01-verification.md) |
-| T02 — Local account access | Not started | — | Update after T02 execution |
+| T02 — Local account access | **Executed and accepted** | 2026-08-31 | 17 full-suite tests passed; live registration/login/logout/guard/restart walkthrough passed; see T02 Implementation Result and [verification record](docs/t02-verification.md) |
 | T03 — Onboarding and learner profile | Not started | — | Update after T03 execution |
 | T04 — Deterministic first lesson loop | Not started | — | Update after T04 execution |
 | T05 — Evidence-based mastery and retry | Not started | — | Update after T05 execution |
@@ -256,6 +256,46 @@ Show registration, failed and successful login, logout, protected navigation, re
 **Out of Scope:**
 - Password recovery, email verification, SSO, account lockout, and production session cookies.
 - Learner profile fields and deletion.
+
+### T02 Implementation Result
+
+**Execution status:** **Executed and accepted on 2026-08-31.** The persistent account flow, authenticated route guard, migration upgrade, automated suite, and live restart walkthrough are complete.
+
+#### Delivered implementation
+
+- Added shared SQLAlchemy declarative metadata and a `users` table containing only identity, Argon2id password hash, and operational timestamp fields.
+- Added local registration and authentication services with NFKC normalization, trimmed display names, case-insensitive unique keys, bounded input lengths, generic login errors, and automatic Argon2 rehash support.
+- Added migration `20260831_0002`, linked to the T01 baseline, and configured Alembic to use the shared application metadata.
+- Added Streamlit registration, sign-in, sign-out, protected navigation, authenticated Home state, and session-only identity. Signed-out users cannot access the five application pages.
+- Added pinned `argon2-cffi` runtime dependencies and documented the username, password, persistence, and demo-authentication boundaries in [README.md](README.md).
+- Added focused authentication, UI-flow, fresh-migration, and T01-upgrade tests.
+
+#### Verification evidence
+
+- Full automated suite: **17 passed**.
+- Focused authentication suite: **5 passed**; focused Streamlit suite: **5 passed**; focused migration suite: **2 passed**.
+- Focused repository/notebook secret scan: **1 passed**.
+- Live browser walkthrough registered two distinct accounts, opened all five protected pages, signed out, rejected an incorrect login generically, accepted a case-insensitive valid login, and rejected a normalized duplicate registration.
+- After a full Streamlit process restart, the session returned to signed out and the persisted account could sign in again.
+- Redacted SQLite inspection showed two distinct user IDs and 97-character hashes with the `$argon2id$` prefix. Temporary walkthrough accounts were removed afterward.
+- Fresh and T01-state databases both upgraded to `20260831_0002 (head)` with the expected `users` schema and no foreign-key violations.
+- Detailed evidence is recorded in [docs/t02-verification.md](docs/t02-verification.md).
+
+#### Important findings and decisions
+
+1. Usernames are NFKC-normalized and trimmed for display, then case-folded for uniqueness and login. They are limited to 3-64 characters and reject Unicode control categories.
+2. Passwords are limited to 12-128 characters. Plaintext passwords are used only during the active hash/verification call and are never placed in session state or persistence.
+3. Registration signs the new user in. Streamlit session/process loss intentionally clears authentication and requires another login; the account itself remains in SQLite.
+4. T02 has no user-owned learning records yet. The UI exposes no user lookup or mutation surface, and authenticated identities remain distinct; future repositories must require the current authenticated user ID for every owned query and mutation.
+5. Schema creation remains migration-owned. Setup and upgrades must run `python -m alembic upgrade head` before starting the application.
+
+#### Handoff notes for T03 and later tasks
+
+- Add learner-profile ownership with a non-null foreign key to `users.id`, and scope every profile repository operation by the authenticated user ID.
+- Validate the session user before reading or writing future owned data; never accept an owner ID from an editable UI control.
+- Preserve the normalized username and password policy, generic authentication failures, and session-only credential boundary.
+- Extend migration tests from `20260831_0002` and keep fresh-database coverage.
+- Logout must clear future in-session lesson/document state as those features are introduced.
 
 ## Task T03 — Onboarding and learner profile
 

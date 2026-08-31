@@ -12,6 +12,7 @@ SRC = PROJECT_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from japanese_workplace_tutor.models import Base
 from japanese_workplace_tutor.settings import get_settings
 
 config = context.config
@@ -19,7 +20,7 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 config.set_main_option("sqlalchemy.url", get_settings().database_url.replace("%", "%%"))
-target_metadata = None
+target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:

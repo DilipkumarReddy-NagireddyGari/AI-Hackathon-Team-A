@@ -1,6 +1,6 @@
 # Japanese Workplace Learning
 
-T01 provides a safe, local Streamlit foundation for a personalized Japanese workplace learning MVP. It intentionally contains no authentication, learning logic, or model calls yet.
+T02 provides a safe, local Streamlit foundation with persistent demo accounts for a personalized Japanese workplace learning MVP. Learning logic and model calls are not implemented yet.
 
 ## Requirements
 
@@ -15,7 +15,7 @@ From PowerShell in the project root:
 2. Install locked direct and development dependencies: `.venv\Scripts\python -m pip install -r requirements-dev.txt`
 3. Establish the migration baseline: `.venv\Scripts\python -m alembic upgrade head`
 
-No model credentials are required for T01. To exercise the configured status only, copy `.env.example` to `.env` and replace every model placeholder with non-production dummy values. Do not commit `.env`.
+No model credentials are required. To exercise the configured status only, copy `.env.example` to `.env` and replace every model placeholder with non-production dummy values. Do not commit `.env`.
 
 ## Run
 
@@ -23,17 +23,25 @@ Start the app with one command:
 
 `.venv\Scripts\python -m streamlit run app.py`
 
-Open the URL shown by Streamlit. Home, Learn, Translate, Progress, and Profile are available from the sidebar. The startup health panel reports only:
+Open the URL shown by Streamlit. Register a local demo account without an email address, then use Home, Learn, Translate, Progress, and Profile from the sidebar. The startup health panel reports only:
 
 - whether the database is ready;
 - whether SQLite foreign-key enforcement is enabled; and
 - whether all future model settings are present.
 
-It never displays setting values. If model settings are absent, all non-model pages remain usable.
+It never displays setting values. If model settings are absent, all non-model pages remain usable after sign-in.
+
+## Demo authentication
+
+- Usernames are Unicode NFKC-normalized and trimmed. Sign-in and uniqueness are case-insensitive, while the normalized display form is preserved.
+- Usernames must be 3-64 characters and cannot contain control characters.
+- Passwords must be 12-128 characters and are persisted only as Argon2id hashes.
+- Accounts remain in SQLite after restart. Authentication is held only in Streamlit session state, so a lost session or application restart requires signing in again.
+- This local mechanism is demo authentication, not enterprise identity. It has no shared/default credentials, email, recovery, SSO, or account lockout.
 
 ## Test
 
-Run all startup, navigation, configuration, database, and secret checks:
+Run all authentication, startup, navigation, migration, configuration, database, and secret checks:
 
 `.venv\Scripts\python -m pytest`
 
@@ -55,11 +63,11 @@ All settings use the `JLT_` environment prefix:
 | `JLT_PRIMARY_MODEL` | No | Future primary model ID |
 | `JLT_FALLBACK_MODEL` | No | Future fallback model ID |
 
-Model status is configured only when all four model variables are present. T01 never contacts a provider.
+Model status is configured only when all four model variables are present. The current application never contacts a provider.
 
 ## Database and migrations
 
-SQLite files are local and ignored by Git. Every application-created SQLite connection executes `PRAGMA foreign_keys=ON`. Alembic owns the schema baseline and will be extended by subsequent tasks.
+SQLite files are local and ignored by Git. Every application-created SQLite connection executes `PRAGMA foreign_keys=ON`. Alembic owns the schema, including the T02 `users` table. Run the upgrade command after pulling schema changes and before starting the app.
 
 Useful migration checks:
 
