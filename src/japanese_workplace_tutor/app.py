@@ -10,6 +10,7 @@ from .auth import AuthenticationError, AuthenticationService, RegistrationError
 from .database import check_database, create_database_engine
 from .lesson import (
     ActiveLesson,
+    ActiveReview,
     FIXTURE_LESSON,
     RETRY_QUESTIONS,
     LessonService,
@@ -27,7 +28,96 @@ from .settings import Settings, get_settings
 PageRenderer = Callable[[], None]
 
 
-def render_home(profile: ProfileRecord | None = None) -> None:
+def _clear_active_review() -> None:
+    for key in list(st.session_state):
+        if key in {"active_due_review", "due_review_results"} or key.startswith(
+            "due_review_"
+        ):
+            st.session_state.pop(key, None)
+
+
+def _continue_learning() -> None:
+    _clear_active_review()
+    st.session_state.navigation = "Learn"
+
+
+def _render_due_review(
+    service: LessonService, user_id: int, active: ActiveReview
+) -> None:
+    st.subheader("Review due items")
+    st.caption(f"{len(active.items)} item{'s' if len(active.items) != 1 else ''} in this review")
+    results = st.session_state.setdefault("due_review_results", {})
+
+    for number, review_item in enumerate(active.items, start=1):
+        question = review_item.question
+        st.markdown(
+            f"**{number}. {review_item.item.expression} · "
+            f"{review_item.item.category.value}**"
+        )
+        st.write(question.prompt)
+        st.caption(question.form.value.replace("_", " ").title())
+        answer_key = (
+            f"due_review_{active.review_session_id}_{question.question_id}"
+        )
+        selected_answer = st.radio(
+            f"Answer for review item {number}",
+            question.options,
+            index=None,
+            key=answer_key,
+            label_visibility="collapsed",
+            disabled=question.question_id in results,
+        )
+        if question.question_id in results:
+            result = results[question.question_id]
+            if result.is_correct:
+                st.success(f"Correct. Outcome: {result.outcome.value.title()}.")
+            else:
+                correct_answer = question.options[question.correct_option_index]
+                st.error(f"Not quite. The correct answer is {correct_answer}.")
+            st.write(question.explanation)
+            st.caption(
+                "Next review: "
+                + result.next_review_at.isoformat(sep=" ", timespec="minutes")
+            )
+        elif st.button(
+            "Submit answer",
+            key=(
+                f"submit_due_review_{active.review_session_id}_"
+                f"{question.question_id}"
+            ),
+        ):
+            if selected_answer is None:
+                st.warning("Choose an answer before submitting.")
+            else:
+                results[question.question_id] = service.submit_review_answer(
+                    user_id,
+                    active.review_session_id,
+                    question.question_id,
+                    question.options.index(selected_answer),
+                )
+                st.rerun()
+
+    if active.items and len(results) == len(active.items):
+        if st.button("Complete review", type="primary", key="complete_due_review"):
+            st.session_state.last_review_summary = {
+                "correct": sum(result.is_correct for result in results.values()),
+                "total": len(active.items),
+                "next_review_at": service.get_next_review_at(user_id),
+            }
+            _clear_active_review()
+            st.rerun()
+
+    st.button("Start a lesson", key="continue_learning", on_click=_continue_learning)
+    if st.button("Skip review", key="skip_due_review"):
+        _clear_active_review()
+        st.rerun()
+
+
+def render_home(
+    profile: ProfileRecord | None = None,
+    service: LessonService | None = None,
+    user_id: int | None = None,
+) -> None:
     st.title("Home")
     username = st.session_state.get("authenticated_username")
     st.write(f"Welcome, {username}.")
@@ -38,7 +128,47 @@ def render_home(profile: ProfileRecord | None = None) -> None:
     st.write("Focus tasks: " + ", ".join(profile.tasks))
     if profile.tools_domain:
         st.caption(f"Tools and domain: {profile.tools_domain}")
-    st.info("A deterministic workplace status-update lesson is ready on Learn.")
+    if service is None or user_id is None:
+        st.info("A deterministic workplace status-update lesson is ready on Learn.")
+        return
+
+    active_review = st.session_state.get("active_due_review")
+    if isinstance(active_review, ActiveReview):
+        _render_due_review(service, user_id, active_review)
+        return
+
+    summary = st.session_state.get("last_review_summary")
+    if isinstance(summary, dict):
+        st.success(
+            f"Review complete: {summary['correct']} of {summary['total']} correct."
+        )
+        next_review_at = summary.get("next_review_at")
+        if next_review_at is not None:
+            st.caption(
+                "Earliest review: "
+                + next_review_at.isoformat(sep=" ", timespec="minutes")
+            )
+
+    due_count = service.get_due_count(user_id)
+    if due_count:
+        st.subheader(f"{due_count} item{'s' if due_count != 1 else ''} due")
+        st.write("A short review is ready. You can skip it and keep learning.")
+        if st.button("Review due items", type="primary", key="start_due_review"):
+            st.session_state.pop("last_review_summary", None)
+            st.session_state.active_due_review = service.start_due_review(user_id)
+            st.session_state.due_review_results = {}
+            st.rerun()
+        st.button(
+            "Start a lesson", key="continue_learning", on_click=_continue_learning
+        )
+    else:
+        st.write("No reviews are due. Continue with the workplace status-update lesson.")
+        st.button(
+            "Continue learning",
+            type="primary",
+            key="continue_learning",
+            on_click=_continue_learning,
+        )
 
 
 def _clear_active_lesson() -> None:
@@ -457,7 +587,9 @@ def render_authentication(service: AuthenticationService) -> bool:
 
 def clear_authenticated_session() -> None:
     _clear_active_lesson()
+    _clear_active_review()
     st.session_state.pop("last_lesson_completion", None)
+    st.session_state.pop("last_review_summary", None)
     st.session_state.pop("authenticated_user_id", None)
     st.session_state.pop("authenticated_username", None)
 
@@ -495,9 +627,11 @@ def main() -> None:
         engine.dispose()
         return
 
-    selected_page = st.sidebar.radio("Navigation", PAGE_RENDERERS.keys())
+    selected_page = st.sidebar.radio(
+        "Navigation", PAGE_RENDERERS.keys(), key="navigation"
+    )
     if selected_page == "Home":
-        render_home(profile)
+        render_home(profile, lesson_service, user_id)
     elif selected_page == "Learn":
         render_learn(lesson_service, user_id)
     elif selected_page == "Progress":

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import sqlite3
 
@@ -10,15 +10,20 @@ from japanese_workplace_tutor.auth import AuthenticationService
 from japanese_workplace_tutor.database import create_database_engine
 from japanese_workplace_tutor.lesson import (
     FIXTURE_LESSON,
+    REVIEW_ITEMS,
+    REVIEW_QUESTIONS,
     RETRY_QUESTIONS,
     LessonService,
     LessonStateError,
+    QuestionForm,
     ReviewOutcome,
 )
 from japanese_workplace_tutor.models import (
     Base,
     CompletedLessonMetadata,
+    LearningItem,
     ReviewAttempt,
+    UserItemProgress,
 )
 from japanese_workplace_tutor.settings import Settings
 
@@ -34,6 +39,92 @@ def create_services(database_path: Path):
     Base.metadata.create_all(engine)
     auth = AuthenticationService(engine)
     return auth, LessonService(engine, clock=lambda: NOW), engine
+
+
+def seed_due_review_items(engine, user_id: int) -> None:
+    with Session(engine) as session:
+        for index, item in enumerate(REVIEW_ITEMS):
+            session.add(
+                LearningItem(
+                    canonical_id=item.canonical_id,
+                    category=item.category.value,
+                    jlpt_level=item.jlpt_level,
+                    jlpt_provenance=item.jlpt_provenance,
+                    jlpt_confidence=item.jlpt_confidence,
+                )
+            )
+            session.add(
+                UserItemProgress(
+                    user_id=user_id,
+                    item_id=item.canonical_id,
+                    mastery_score=0.1 + (index * 0.05),
+                    dimension_scores={"reading": 0.8} if index == 0 else {},
+                    next_review_at=NOW - timedelta(days=2 if index < 3 else 1),
+                )
+            )
+        session.commit()
+
+
+def test_due_review_selection_is_user_scoped_ordered_and_limited(
+    tmp_path: Path,
+) -> None:
+    auth, lessons, engine = create_services(tmp_path / "lesson.db")
+    alice = auth.register("Alice", "correct horse battery staple")
+    bob = auth.register("Bob", "another secure password")
+    seed_due_review_items(engine, alice.id)
+
+    review = lessons.start_due_review(
+        alice.id, "review-11111111-1111-1111-1111-111111111111"
+    )
+
+    assert lessons.get_due_count(alice.id) == 7
+    assert lessons.get_due_count(bob.id) == 0
+    assert len(review.items) == 5
+    assert tuple(item.item.canonical_id for item in review.items) == tuple(
+        item.canonical_id for item in REVIEW_ITEMS[:5]
+    )
+    assert review.items[0].question.form is QuestionForm.MEANING
+    engine.dispose()
+
+
+def test_review_start_is_a_noop_and_submission_is_idempotent(tmp_path: Path) -> None:
+    database_path = tmp_path / "lesson.db"
+    auth, lessons, engine = create_services(database_path)
+    user = auth.register("Alice", "correct horse battery staple")
+    seed_due_review_items(engine, user.id)
+    before = lessons.get_progress(user.id)
+    review = lessons.start_due_review(
+        user.id, "review-11111111-1111-1111-1111-111111111111"
+    )
+    assert lessons.get_progress(user.id) == before
+
+    review_item = review.items[0]
+    first = lessons.submit_review_answer(
+        user.id,
+        review.review_session_id,
+        review_item.question.question_id,
+        review_item.question.correct_option_index,
+    )
+    duplicate = lessons.submit_review_answer(
+        user.id,
+        review.review_session_id,
+        review_item.question.question_id,
+        review_item.question.correct_option_index + 1,
+    )
+
+    assert first.is_correct is True
+    assert first.outcome is ReviewOutcome.GOOD
+    assert duplicate == first.__class__(**{**first.__dict__, "duplicate": True})
+    assert lessons.get_due_count(user.id) == 6
+    with Session(engine) as session:
+        assert session.scalar(select(func.count(ReviewAttempt.id))) == 1
+    engine.dispose()
+
+    _, restarted_lessons, restarted_engine = create_services(database_path)
+    assert restarted_lessons.get_due_count(user.id) == 6
+    with Session(restarted_engine) as session:
+        assert session.scalar(select(func.count(ReviewAttempt.id))) == 1
+    restarted_engine.dispose()
 
 
 def test_exposure_does_not_raise_mastery_and_answers_are_idempotent(
@@ -249,13 +340,30 @@ def test_database_excludes_replayable_fixture_content(tmp_path: Path) -> None:
             question.correct_option_index,
         )
     lessons.complete_fixture_lesson(user.id, active.lesson_session_id)
+    with Session(engine) as session:
+        for progress in session.scalars(select(UserItemProgress)).all():
+            progress.next_review_at = NOW
+        session.commit()
+    review = lessons.start_due_review(user.id)
+    for review_item in review.items:
+        question = review_item.question
+        lessons.submit_review_answer(
+            user.id,
+            review.review_session_id,
+            question.question_id,
+            question.correct_option_index,
+        )
     engine.dispose()
 
     with sqlite3.connect(database_path) as connection:
         database_dump = "\n".join(connection.iterdump())
 
     prohibited_content = [FIXTURE_LESSON.passage, FIXTURE_LESSON.recap]
-    prohibited_content.extend(item.example for item in FIXTURE_LESSON.items)
+    prohibited_content.extend(item.example for item in REVIEW_ITEMS)
+    for questions in REVIEW_QUESTIONS.values():
+        for question in questions:
+            prohibited_content.extend((question.prompt, question.explanation))
+            prohibited_content.extend(question.options)
     for question in FIXTURE_LESSON.questions:
         prohibited_content.extend((question.prompt, question.explanation))
         prohibited_content.extend(question.options)

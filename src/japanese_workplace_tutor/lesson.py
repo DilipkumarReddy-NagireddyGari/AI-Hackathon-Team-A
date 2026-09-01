@@ -267,6 +267,84 @@ RETRY_QUESTIONS = {
     ),
 }
 
+SUPPLEMENTAL_REVIEW_ITEMS = (
+    FixtureItem(
+        canonical_id="vocabulary:kakunin",
+        category=ItemCategory.VOCABULARY,
+        expression="確認",
+        reading="かくにん",
+        meaning="confirmation; checking",
+        example="日程を確認します。",
+        jlpt_level="JLPT N3",
+        jlpt_provenance="fixture-reference",
+        jlpt_confidence=0.9,
+    ),
+    FixtureItem(
+        canonical_id="grammar-node",
+        category=ItemCategory.GRAMMAR,
+        expression="〜ので",
+        reading="〜ので",
+        meaning="because; giving a reason politely",
+        example="問題が見つかったので、確認します。",
+        jlpt_level="JLPT N4",
+        jlpt_provenance="fixture-reference",
+        jlpt_confidence=0.9,
+    ),
+)
+
+SUPPLEMENTAL_REVIEW_QUESTIONS = (
+    FixtureQuestion(
+        question_id="review-meaning-confirm",
+        item_id="vocabulary:kakunin",
+        form=QuestionForm.MEANING,
+        prompt="What workplace action does 確認する describe?",
+        options=("Checking", "Reporting", "Sharing", "Advancing"),
+        correct_option_index=0,
+        explanation="確認する means to check or confirm something.",
+    ),
+    FixtureQuestion(
+        question_id="review-reading-confirm",
+        item_id="vocabulary:kakunin",
+        form=QuestionForm.READING,
+        prompt="How is 確認 read?",
+        options=("かくにん", "かくじん", "かんにん", "かんじん"),
+        correct_option_index=0,
+        explanation="確認 is read かくにん.",
+    ),
+    FixtureQuestion(
+        question_id="review-meaning-node",
+        item_id="grammar-node",
+        form=QuestionForm.MEANING,
+        prompt="What relationship does 〜ので express?",
+        options=("A reason", "A comparison", "Permission", "A prohibition"),
+        correct_option_index=0,
+        explanation="〜ので gives a reason, often with a polite or neutral tone.",
+    ),
+    FixtureQuestion(
+        question_id="review-cloze-node",
+        item_id="grammar-node",
+        form=QuestionForm.CONTEXTUAL_CLOZE,
+        prompt="Choose the reason marker: 問題が見つかった___、確認します。",
+        options=("ので", "まで", "より", "でも"),
+        correct_option_index=0,
+        explanation="ので links the discovered problem to the reason for checking.",
+    ),
+)
+
+REVIEW_ITEMS = (*FIXTURE_LESSON.items, *SUPPLEMENTAL_REVIEW_ITEMS)
+REVIEW_QUESTIONS = {
+    item.canonical_id: tuple(
+        question
+        for question in (
+            *FIXTURE_LESSON.questions,
+            *RETRY_QUESTIONS.values(),
+            *SUPPLEMENTAL_REVIEW_QUESTIONS,
+        )
+        if question.item_id == item.canonical_id
+    )
+    for item in REVIEW_ITEMS
+}
+
 
 class LessonStateError(ValueError):
     pass
@@ -276,6 +354,21 @@ class LessonStateError(ValueError):
 class ActiveLesson:
     lesson_session_id: str
     lesson: FixtureLesson
+
+
+@dataclass(frozen=True)
+class DueReviewItem:
+    item: FixtureItem
+    question: FixtureQuestion
+    mastery_score: float
+    dimension_scores: dict[str, float]
+    next_review_at: datetime
+
+
+@dataclass(frozen=True)
+class ActiveReview:
+    review_session_id: str
+    items: tuple[DueReviewItem, ...]
 
 
 @dataclass(frozen=True)
@@ -365,6 +458,79 @@ class LessonService:
             session.commit()
         return ActiveLesson(session_id, FIXTURE_LESSON)
 
+    def get_due_count(self, user_id: int) -> int:
+        with Session(self._engine) as session:
+            count = session.scalar(
+                select(func.count(UserItemProgress.id)).where(
+                    UserItemProgress.user_id == user_id,
+                    UserItemProgress.item_id.in_(REVIEW_QUESTIONS),
+                    UserItemProgress.next_review_at.is_not(None),
+                    UserItemProgress.next_review_at <= self._clock(),
+                )
+            )
+            return int(count or 0)
+
+    def get_next_review_at(self, user_id: int) -> datetime | None:
+        with Session(self._engine) as session:
+            return session.scalar(
+                select(func.min(UserItemProgress.next_review_at)).where(
+                    UserItemProgress.user_id == user_id,
+                    UserItemProgress.next_review_at.is_not(None),
+                )
+            )
+
+    def start_due_review(
+        self, user_id: int, review_session_id: str | None = None
+    ) -> ActiveReview:
+        session_id = review_session_id or str(uuid4())
+        with Session(self._engine) as session:
+            rows = session.execute(
+                select(UserItemProgress, LearningItem)
+                .join(LearningItem, LearningItem.canonical_id == UserItemProgress.item_id)
+                .where(
+                    UserItemProgress.user_id == user_id,
+                    UserItemProgress.item_id.in_(REVIEW_QUESTIONS),
+                    UserItemProgress.next_review_at.is_not(None),
+                    UserItemProgress.next_review_at <= self._clock(),
+                )
+                .order_by(
+                    UserItemProgress.next_review_at,
+                    UserItemProgress.mastery_score,
+                    UserItemProgress.item_id,
+                )
+                .limit(5)
+            ).all()
+            review_items = tuple(
+                self._due_review_item(progress, item) for progress, item in rows
+            )
+        return ActiveReview(session_id, review_items)
+
+    def submit_review_answer(
+        self,
+        user_id: int,
+        review_session_id: str,
+        question_id: str,
+        selected_option_index: int,
+    ) -> AttemptResult:
+        question = self._find_question(
+            (
+                question
+                for candidates in REVIEW_QUESTIONS.values()
+                for question in candidates
+            ),
+            question_id,
+        )
+        if question is None:
+            raise LessonStateError("This question is not part of the active review.")
+        return self._submit_question(
+            user_id,
+            review_session_id,
+            question,
+            selected_option_index,
+            is_retry=False,
+            require_due=True,
+        )
+
     def submit_answer(
         self,
         user_id: int,
@@ -415,6 +581,7 @@ class LessonService:
         selected_option_index: int,
         *,
         is_retry: bool,
+        require_due: bool = False,
     ) -> AttemptResult:
         if selected_option_index not in range(len(question.options)):
             raise LessonStateError("Select one of the available answers.")
@@ -435,15 +602,22 @@ class LessonService:
                 return self._attempt_result(existing, question.question_id, progress, True)
 
             fixture_item = next(
-                item
-                for item in FIXTURE_LESSON.items
-                if item.canonical_id == question.item_id
+                item for item in REVIEW_ITEMS if item.canonical_id == question.item_id
             )
             self._ensure_item(session, fixture_item)
             progress = self._get_progress(session, user_id, question.item_id)
             if progress is None:
                 progress = UserItemProgress(user_id=user_id, item_id=question.item_id)
                 session.add(progress)
+            elif require_due and (
+                progress.next_review_at is None or progress.next_review_at > now
+            ):
+                raise LessonStateError("This item is not currently due for review.")
+
+            if require_due:
+                selected_question = self._select_review_question(progress, fixture_item)
+                if question.question_id != selected_question.question_id:
+                    raise LessonStateError("This question is not part of the active review.")
 
             is_correct = selected_option_index == question.correct_option_index
             if is_correct:
@@ -583,6 +757,36 @@ class LessonService:
                 .order_by(CompletedLessonMetadata.completed_at.desc())
             ).all()
             return tuple(self._completion_record(row) for row in rows)
+
+    def _due_review_item(
+        self, progress: UserItemProgress, learning_item: LearningItem
+    ) -> DueReviewItem:
+        if progress.next_review_at is None:
+            raise LessonStateError("A due review item must have a review date.")
+        fixture_item = next(
+            item for item in REVIEW_ITEMS if item.canonical_id == learning_item.canonical_id
+        )
+        return DueReviewItem(
+            item=fixture_item,
+            question=self._select_review_question(progress, fixture_item),
+            mastery_score=progress.mastery_score,
+            dimension_scores=dict(progress.dimension_scores or {}),
+            next_review_at=progress.next_review_at,
+        )
+
+    def _select_review_question(
+        self, progress: UserItemProgress, fixture_item: FixtureItem
+    ) -> FixtureQuestion:
+        return min(
+            REVIEW_QUESTIONS[fixture_item.canonical_id],
+            key=lambda question: (
+                progress.dimension_scores.get(
+                    self._skill_dimension(question, fixture_item.category).value,
+                    0.0,
+                ),
+                question.question_id,
+            ),
+        )
 
     @staticmethod
     def _ensure_item(session: Session, fixture_item: FixtureItem) -> None:

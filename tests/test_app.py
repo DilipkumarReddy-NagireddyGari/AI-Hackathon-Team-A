@@ -1,13 +1,17 @@
+from datetime import datetime
 from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
 from streamlit.testing.v1 import AppTest
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from japanese_workplace_tutor.auth import AuthenticationService
 from japanese_workplace_tutor.app import PAGE_RENDERERS
 from japanese_workplace_tutor.database import create_database_engine
-from japanese_workplace_tutor.lesson import FIXTURE_LESSON, LessonService
+from japanese_workplace_tutor.lesson import FIXTURE_LESSON, REVIEW_ITEMS, LessonService
+from japanese_workplace_tutor.models import LearningItem, ReviewAttempt, UserItemProgress
 from japanese_workplace_tutor.profile import JapaneseLevel, ProfileService
 from japanese_workplace_tutor.settings import Settings, get_settings
 
@@ -38,6 +42,33 @@ def create_completed_user(database_path: Path):
     )
     engine.dispose()
     return user
+
+
+def seed_due_item(database_path: Path, user_id: int) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{database_path.as_posix()}", _env_file=None
+    )
+    engine = create_database_engine(settings)
+    item = REVIEW_ITEMS[0]
+    with Session(engine) as session:
+        session.add(
+            LearningItem(
+                canonical_id=item.canonical_id,
+                category=item.category.value,
+                jlpt_level=item.jlpt_level,
+                jlpt_provenance=item.jlpt_provenance,
+                jlpt_confidence=item.jlpt_confidence,
+            )
+        )
+        session.add(
+            UserItemProgress(
+                user_id=user_id,
+                item_id=item.canonical_id,
+                next_review_at=datetime(2026, 8, 31, 0, 0, 0),
+            )
+        )
+        session.commit()
+    engine.dispose()
 
 
 def test_all_required_pages_are_registered() -> None:
@@ -90,6 +121,61 @@ def test_each_page_opens_without_exception(monkeypatch, tmp_path: Path) -> None:
         app.sidebar.radio[0].set_value(page_name).run()
         assert not app.exception
         assert any(title.value == page_name for title in app.title)
+
+
+def test_home_due_review_can_be_skipped_then_completed(
+    monkeypatch, tmp_path: Path
+) -> None:
+    database_path = tmp_path / "app.db"
+    prepare_database(monkeypatch, database_path)
+    user = create_completed_user(database_path)
+    seed_due_item(database_path, user.id)
+    app = AppTest.from_file(str(PROJECT_ROOT / "app.py")).run()
+    app.session_state["authenticated_user_id"] = user.id
+    app.session_state["authenticated_username"] = user.username
+    app.run()
+
+    assert app.button(key="start_due_review")
+    assert app.button(key="continue_learning")
+    app.button(key="start_due_review").click().run()
+    active = app.session_state["active_due_review"]
+    app.button(key="skip_due_review").click().run()
+
+    settings = Settings(
+        database_url=f"sqlite:///{database_path.as_posix()}", _env_file=None
+    )
+    engine = create_database_engine(settings)
+    with Session(engine) as session:
+        unchanged = session.scalar(
+            select(UserItemProgress).where(UserItemProgress.user_id == user.id)
+        )
+        assert unchanged is not None
+        assert unchanged.next_review_at == datetime(2026, 8, 31, 0, 0, 0)
+        assert session.scalars(select(ReviewAttempt)).all() == []
+
+    app.button(key="start_due_review").click().run()
+    active = app.session_state["active_due_review"]
+    review_item = active.items[0]
+    question = review_item.question
+    app.radio(
+        key=f"due_review_{active.review_session_id}_{question.question_id}"
+    ).set_value(question.options[question.correct_option_index])
+    app.button(
+        key=f"submit_due_review_{active.review_session_id}_{question.question_id}"
+    ).click().run()
+    app.button(key="complete_due_review").click().run()
+
+    assert "start_due_review" not in {button.key for button in app.button}
+    assert app.button(key="continue_learning")
+    assert any("Review complete: 1 of 1 correct" in value.value for value in app.success)
+    with Session(engine) as session:
+        assert len(session.scalars(select(ReviewAttempt)).all()) == 1
+        updated = session.scalar(
+            select(UserItemProgress).where(UserItemProgress.user_id == user.id)
+        )
+        assert updated is not None
+        assert updated.next_review_at > datetime(2026, 8, 31, 0, 0, 0)
+    engine.dispose()
 
 
 def test_register_logout_and_login_flow(monkeypatch, tmp_path: Path) -> None:

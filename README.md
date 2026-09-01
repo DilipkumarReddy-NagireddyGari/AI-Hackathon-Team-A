@@ -1,6 +1,6 @@
 # Japanese Workplace Learning
 
-T05 provides a safe, local Streamlit application with persistent demo accounts, user-scoped learner profiles, and a deterministic workplace lesson with compact evidence-based mastery and spaced review. Model calls are not implemented yet.
+T06 provides a safe, local Streamlit application with persistent demo accounts, user-scoped learner profiles, a deterministic workplace lesson, compact evidence-based mastery, and a skippable due-item review workflow. Model calls are not implemented yet.
 
 ## Requirements
 
@@ -54,6 +54,14 @@ It never displays setting values. If model settings are absent, all non-model pa
 - Each question submission is immutable and idempotent for its user and lesson session. Leaving an unfinished lesson retains already submitted compact evidence but writes no completion record.
 - Progress shows user-scoped exposure, answer counts, overall mastery, latest outcome, SM-2 interval/ease, consecutive successful reviews, next-review timestamps, and the latest minimal completion metadata.
 - Active passage, examples, questions, options, explanations, feedback, and recap exist only in Streamlit session state. SQLite stores canonical item IDs, compact answer evidence, schedule state, and topic/difficulty/item-ID completion metadata. Refresh/process loss removes active content and requires sign-in again.
+
+## Due-item review
+
+- Home queries the signed-in learner's persisted schedules. When items are due, **Review due items** is the primary action and shows the total due count; **Start a lesson** remains available.
+- A review contains at most five items ordered by earliest due date, lowest mastery, then canonical ID. The deterministic question targets the weakest available evidence dimension.
+- Starting or skipping a review does not change progress. Only submitted multiple-choice answers update compact evidence, mastery, and SM-2 schedules through policy `t05-v1`.
+- Each submission is idempotent for the user, review session, and question. Immediate feedback shows the mapped outcome and new review date.
+- Completing a review returns Home, reports the result, shows the earliest remaining review schedule, and refreshes the due count. Review prompts and feedback remain session-only and are not stored in SQLite.
 
 ### Mastery policy `t05-v1`
 

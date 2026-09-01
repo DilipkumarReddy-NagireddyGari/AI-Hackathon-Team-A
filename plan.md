@@ -36,7 +36,7 @@ This is a living execution record. After every task, update its status here and 
 | T03 — Onboarding and learner profile | **Executed and accepted** | 2026-08-31 | 21 full-suite tests passed; live custom-role onboarding/edit/restart walkthrough passed; see T03 Implementation Result and [verification record](docs/t03-verification.md) |
 | T04 — Deterministic first lesson loop | **Executed and accepted** | 2026-08-31 | 26 full-suite tests passed; live mixed-answer lesson/restart/retention walkthrough passed; see T04 Implementation Result and [verification record](docs/t04-verification.md) |
 | T05 — Evidence-based mastery and retry | **Executed** | 2026-08-31 | 29 full-suite tests passed; live all-wrong/recovery walkthrough passed; see T05 Implementation Result and [verification record](docs/t05-verification.md) |
-| T06 — Due-item review experience | Not started | — | Update after T06 execution |
+| T06 — Due-item review experience | **Executed** | 2026-09-01 | 32 full-suite tests passed; live seven-due/skip/five-item-review/post-review walkthrough passed; see T06 Implementation Result and [verification record](docs/t06-verification.md) |
 | T07 — Generated scenario lessons | Not started | — | Update after T07 execution |
 | T08 — Personalized surprise lessons | Not started | — | Update after T08 execution |
 | T09 — Adaptive lesson presentation | Not started | — | Update after T09 execution |
@@ -627,6 +627,47 @@ Show Home before due, Home with more than five due, a five-item review, skip beh
 - Generated review questions.
 - Push/email reminders.
 - Blocking lesson access until reviews are complete.
+
+### T06 Implementation Result
+
+**Execution status:** **Executed on 2026-09-01.** The due-item query, deterministic five-item review, skippable Home workflow, exact-once evidence update, automated checks, and live product checkpoint are complete.
+
+#### Delivered implementation
+
+- Added authenticated, controlled-clock due counts and selection using `next_review_at <= now` in [src/japanese_workplace_tutor/lesson.py](src/japanese_workplace_tutor/lesson.py).
+- Due items are ordered by earliest schedule, lowest mastery, then canonical ID and capped at five per session.
+- Added deterministic review templates for all fixture targets plus two supplemental targets so the five-item limit can be verified with more than five due records. Each item selects its lowest-scored available skill dimension with a stable question-ID tie-breaker.
+- Review submissions reuse the T05 `t05-v1` evidence, mastery, outcome, idempotency, and SM-2 path. Starting or skipping a review performs no writes, and duplicate submissions return the original result without creating another evidence row.
+- Home now shows the due count and makes **Review due items** primary when work is due while retaining **Start a lesson**. With no due work, **Continue learning** is primary.
+- Added session-only review rendering, immediate correction, outcome and next-date feedback, safe skip, completion summary, remaining due count, and earliest remaining review display in [src/japanese_workplace_tutor/app.py](src/japanese_workplace_tutor/app.py).
+- Expanded service, Streamlit integration, user-isolation, controlled-clock, limit/order, skip, idempotency, and retention coverage in [tests/test_lesson.py](tests/test_lesson.py) and [tests/test_app.py](tests/test_app.py).
+
+#### Verification evidence
+
+- Full automated suite: **32 passed**.
+- Focused T06 lesson and app slices: **17 passed** before final full-suite validation.
+- Focused repository/notebook secret scan: **1 passed**.
+- Migration compatibility: **2 passed** for a clean database and the populated T04-to-T05 upgrade path. T06 adds no schema and keeps Alembic head at `20260831_0005`.
+- Pylance and VS Code reported no diagnostics in the changed service, UI, and test files; `git diff --check` passed.
+- The retention audit submitted fixture and due-review answers, then found no passages, prompts, options, explanations, examples, or recap in SQLite.
+- Live browser verification seeded seven due items. Home showed **7 items due**, the review displayed exactly five ordered items, Skip returned to **7 items due**, and a mixed review completed with **4 of 5 correct**. Home then showed the two untouched due items and retained **Start a lesson**.
+- Detailed evidence is recorded in [docs/t06-verification.md](docs/t06-verification.md).
+
+#### Important findings and decisions
+
+1. A review session is ephemeral application state. Starting and skipping do not reserve items or mutate schedules; only submitted objective answers persist.
+2. The existing per-user idempotency key, derived from review-session ID and question ID, prevents repeated UI submissions from double-scheduling evidence.
+3. The Home completion summary shows the earliest schedule across all items. When more than five were due, this can remain overdue because untouched due items are intentionally left for another review.
+4. T06 requires no schema migration. Existing T05 progress and evidence rows remain authoritative, and the migration head stays `20260831_0005`.
+5. Deterministic local templates cover the current fixture bank. Generated review questions remain out of scope and must pass T07 validation before entering the same trusted submission path.
+
+#### Handoff notes for T07 and later tasks
+
+- T07 may reuse `FixtureQuestion`-shaped validated questions for rendering, but generated content must not be added to persisted review rows beyond canonical IDs and compact evidence.
+- T08 topic selection can consume due IDs/counts but must not mutate review state or block a new lesson.
+- T10 should reuse `get_due_count`, `get_next_review_at`, and user-scoped progress rather than duplicate due-date logic.
+- If concurrent or resumable review sessions are later required, introduce explicit persisted session membership before allowing a client to submit arbitrary review question IDs. The current local Streamlit workflow trusts session-only `ActiveReview` state while the service still enforces user ownership, due state, deterministic question choice, and idempotency.
+- Continue testing due selection with an injected clock and preserve the stable order: schedule, mastery, canonical ID.
 
 ## Task T07 — Validated generated scenario lessons
 
