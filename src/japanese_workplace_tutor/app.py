@@ -1,7 +1,8 @@
 """Streamlit application with persistent local demo authentication."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from html import escape
 from pathlib import Path
 
 import streamlit as st
@@ -21,10 +22,15 @@ from .lesson import (
     ActiveLesson,
     ActiveLessonDraft,
     ActiveReview,
+    AnswerConfidence,
     FIXTURE_LESSON,
+    LessonExplanationPoint,
+    LessonLineExplanation,
     LessonService,
     LessonStateError,
     ProgressRecord,
+    QuestionForm,
+    display_options,
 )
 from .profile import (
     JapaneseLevel,
@@ -36,6 +42,101 @@ from .profile import (
 from .settings import Settings, get_settings
 
 PageRenderer = Callable[[], None]
+
+JAPANESE_STYLE = """
+<style>
+.jp-line { font-size: 1.35rem; line-height: 2.2; margin: 0.15rem 0 0.4rem 0;
+           font-family: "Yu Gothic", "Meiryo", "Noto Sans JP", "Hiragino Kaku Gothic ProN",
+           sans-serif; }
+.jp-line rt { font-size: 0.5em; opacity: 0.75; font-weight: 400; }
+.jp-speaker { font-weight: 600; opacity: 0.7; margin-right: 0.4rem; }
+</style>
+"""
+
+
+def _furigana_html(japanese_text: str, points: Sequence[LessonExplanationPoint]) -> str:
+    """Wrap known kanji expressions in ruby tags, escaping all model text first."""
+
+    rubies = sorted(
+        (
+            (point.expression, point.reading)
+            for point in points
+            if point.expression and point.reading
+            and any("\u3400" <= character <= "\u9fff" for character in point.expression)
+        ),
+        key=lambda pair: len(pair[0]),
+        reverse=True,
+    )
+    pieces: list[str] = []
+    index = 0
+    while index < len(japanese_text):
+        for expression, reading in rubies:
+            if japanese_text.startswith(expression, index):
+                pieces.append(
+                    f"<ruby>{escape(expression)}<rt>{escape(reading)}</rt></ruby>"
+                )
+                index += len(expression)
+                break
+        else:
+            pieces.append(escape(japanese_text[index]))
+            index += 1
+    return "".join(pieces)
+
+
+def _render_japanese_line(
+    japanese_text: str,
+    points: Sequence[LessonExplanationPoint],
+    show_furigana: bool,
+) -> None:
+    speaker, separator, spoken = japanese_text.partition(": ")
+    if not separator:
+        speaker, spoken = "", japanese_text
+    body = (
+        _furigana_html(spoken, points) if show_furigana else escape(spoken)
+    )
+    prefix = f'<span class="jp-speaker">{escape(speaker)}</span>' if speaker else ""
+    st.markdown(
+        f'<div class="jp-line" lang="ja">{prefix}{body}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _line_points(line: LessonLineExplanation) -> tuple[LessonExplanationPoint, ...]:
+    return (*line.kanji, *line.vocabulary, *line.grammar)
+
+
+def _confidence_input(key: str, disabled: bool) -> AnswerConfidence:
+    choice = st.radio(
+        "How sure are you?",
+        ("I am sure", "I guessed"),
+        index=0,
+        key=key,
+        horizontal=True,
+        disabled=disabled,
+    )
+    return (
+        AnswerConfidence.GUESSED if choice == "I guessed" else AnswerConfidence.SURE
+    )
+
+
+def _glossary(
+    line_explanations: Sequence[LessonLineExplanation],
+) -> list[tuple[str, LessonExplanationPoint, list[int]]]:
+    """Collapse repeated expressions into one entry listing the lines they appear on."""
+
+    entries: dict[tuple[str, str], tuple[str, LessonExplanationPoint, list[int]]] = {}
+    for number, line in enumerate(line_explanations, start=1):
+        for label, points in (
+            ("Kanji", line.kanji),
+            ("Vocabulary", line.vocabulary),
+            ("Grammar", line.grammar),
+        ):
+            for point in points:
+                key = (label, point.expression)
+                if key not in entries:
+                    entries[key] = (label, point, [])
+                entries[key][2].append(number)
+    return list(entries.values())
 
 
 @st.cache_resource
@@ -51,12 +152,18 @@ def _generation_service(
     fallback_model: str,
     timeout_seconds: float,
     primary_timeout_seconds: float,
+    hedge_after_seconds: float | None,
+    parallel_explanations: bool,
+    explanation_workers: int,
 ) -> LessonGenerationService:
     return LessonGenerationService(
         OpenAICompatibleTransport(base_url, _api_key, timeout_seconds),
         primary_model,
         fallback_model,
         primary_timeout_seconds=primary_timeout_seconds,
+        hedge_after_seconds=hedge_after_seconds,
+        parallel_explanations=parallel_explanations,
+        explanation_workers=explanation_workers,
     )
 
 
@@ -105,11 +212,15 @@ def _render_due_review(
         )
         selected_answer = st.radio(
             f"Answer for review item {number}",
-            question.options,
+            display_options(question),
             index=None,
             key=answer_key,
             label_visibility="collapsed",
             disabled=question.question_id in results,
+        )
+        confidence = _confidence_input(
+            f"due_review_confidence_{active.review_session_id}_{question.question_id}",
+            question.question_id in results,
         )
         if question.question_id in results:
             result = results[question.question_id]
@@ -138,6 +249,7 @@ def _render_due_review(
                     active.review_session_id,
                     question.question_id,
                     question.options.index(selected_answer),
+                    confidence=confidence,
                 )
                 st.rerun()
 
@@ -331,35 +443,72 @@ def render_learn(
     st.caption(f"Difficulty: {lesson.difficulty}")
     if provider_name is not None:
         st.caption(f"Lesson generated with {provider_name}")
-    st.subheader("Lesson Conversation")
-    for dialogue_line in lesson.passage.splitlines():
-        if dialogue_line.strip():
-            st.write(dialogue_line)
 
-    if line_explanations:
-        st.subheader("Explanation")
+    target_expressions = {item.expression for item in lesson.items}
+    points_by_line = {
+        line.japanese_text: _line_points(line) for line in line_explanations
+    }
+    furigana_column, english_column = st.columns(2)
+    show_furigana = furigana_column.toggle("Furigana", value=True, key="show_furigana")
+    show_english = english_column.toggle(
+        "Show English", value=False, key="show_english"
+    )
+
+    conversation_tab, breakdown_tab, glossary_tab = st.tabs(
+        ("Conversation", "Line breakdown", "Glossary")
+    )
+
+    with conversation_tab:
+        for number, dialogue_line in enumerate(
+            (line for line in lesson.passage.splitlines() if line.strip()), start=1
+        ):
+            _render_japanese_line(
+                dialogue_line.strip(),
+                points_by_line.get(dialogue_line.strip(), ()),
+                show_furigana,
+            )
+            if show_english and number <= len(line_explanations):
+                st.caption(line_explanations[number - 1].english_meaning)
+
+    with breakdown_tab:
+        if not line_explanations:
+            st.caption("This lesson has no line-by-line explanation.")
         for number, line in enumerate(line_explanations, start=1):
-            separator = ":" if ":" in line.japanese_text else "："
-            speaker = line.japanese_text.split(separator, 1)[0].strip()
-            st.markdown(f"### {speaker} — Line {number}")
-            st.markdown("**Japanese:**")
-            st.write(line.japanese_text)
-            st.markdown("**English meaning:**")
-            st.write(line.english_meaning)
-            for label, points in (
-                ("Kanji", line.kanji),
-                ("Vocabulary", line.vocabulary),
-                ("Grammar", line.grammar),
-            ):
-                st.markdown(f"**{label}:**")
-                if points:
+            introduced = _line_points(line)
+            summary = ", ".join(point.expression for point in introduced) or "review"
+            with st.expander(f"Line {number} — {summary}"):
+                _render_japanese_line(
+                    line.japanese_text, introduced, show_furigana
+                )
+                st.write(line.english_meaning)
+                for label, points in (
+                    ("Kanji", line.kanji),
+                    ("Vocabulary", line.vocabulary),
+                    ("Grammar", line.grammar),
+                ):
                     for point in points:
-                        st.write(
-                            f"{point.expression} ({point.reading}): "
-                            f"{point.meaning}. {point.explanation}"
+                        badge = (
+                            " ⭐ practice target"
+                            if point.expression in target_expressions
+                            else ""
                         )
-                else:
-                    st.write(f"No {label.lower()} to explain in this line.")
+                        st.markdown(
+                            f"**{label} · {point.expression}** ({point.reading}){badge}"
+                        )
+                        st.write(f"{point.meaning}. {point.explanation}")
+
+    with glossary_tab:
+        glossary = _glossary(line_explanations)
+        if not glossary:
+            st.caption("This lesson has no glossary entries.")
+        for label, point, line_numbers in glossary:
+            lines_text = ", ".join(str(number) for number in line_numbers)
+            badge = " ⭐" if point.expression in target_expressions else ""
+            st.markdown(
+                f"**{point.expression}**{badge} ({point.reading}) · {label} · "
+                f"line {lines_text}"
+            )
+            st.write(f"{point.meaning}. {point.explanation}")
 
     if isinstance(draft, ActiveLessonDraft):
         future = st.session_state.get("quiz_generation_future")
@@ -408,19 +557,29 @@ def render_learn(
     if active.quiz_provider_name is not None:
         st.caption(f"Quiz generated with {active.quiz_provider_name}")
     answer_results = st.session_state.setdefault("lesson_answer_results", {})
+    items_by_id = {item.canonical_id: item for item in lesson.items}
     for number, question in enumerate(lesson.questions, start=1):
         st.markdown(f"**{number}. {question.prompt}**")
         st.caption(question.form.value.replace("_", " ").title())
+        if question.form is QuestionForm.CONTEXTUAL_CLOZE:
+            source_item = items_by_id.get(question.item_id)
+            if source_item is not None:
+                st.caption(f"From the lesson: {source_item.example}")
         answer_key = f"lesson_answer_{active.lesson_session_id}_{question.question_id}"
+        answered = question.question_id in answer_results
         selected_answer = st.radio(
             f"Answer for question {number}",
-            question.options,
+            display_options(question),
             index=None,
             key=answer_key,
             label_visibility="collapsed",
-            disabled=question.question_id in answer_results,
+            disabled=answered,
         )
-        if question.question_id in answer_results:
+        confidence = _confidence_input(
+            f"lesson_confidence_{active.lesson_session_id}_{question.question_id}",
+            answered,
+        )
+        if answered:
             if answer_results[question.question_id]:
                 st.success("Correct.")
             else:
@@ -439,6 +598,7 @@ def render_learn(
                     question.question_id,
                     question.options.index(selected_answer),
                     active_lesson=active,
+                    confidence=confidence,
                 )
                 answer_results[question.question_id] = result.is_correct
                 st.rerun()
@@ -458,19 +618,30 @@ def render_learn(
                 "These alternate question forms revisit concepts missed earlier. "
                 "Recovery is stored separately from the original answer."
             )
+        questions_by_item = {
+            question.item_id: question for question in lesson.questions
+        }
         for number, retry in enumerate(required_retries, start=1):
+            missed = questions_by_item.get(retry.item_id)
+            if missed is not None:
+                st.info(f"Before you retry: {missed.explanation}")
             st.markdown(f"**Retry {number}. {retry.prompt}**")
             st.caption(retry.form.value.replace("_", " ").title())
             retry_key = f"lesson_retry_{active.lesson_session_id}_{retry.question_id}"
+            retried = retry.question_id in retry_results
             selected_retry = st.radio(
                 f"Answer for retry {number}",
-                retry.options,
+                display_options(retry),
                 index=None,
                 key=retry_key,
                 label_visibility="collapsed",
-                disabled=retry.question_id in retry_results,
+                disabled=retried,
             )
-            if retry.question_id in retry_results:
+            retry_confidence = _confidence_input(
+                f"retry_confidence_{active.lesson_session_id}_{retry.question_id}",
+                retried,
+            )
+            if retried:
                 if retry_results[retry.question_id]:
                     st.success("Recovered. This counts as Hard, not a first-try success.")
                 else:
@@ -490,6 +661,7 @@ def render_learn(
                         retry.question_id,
                         retry.options.index(selected_retry),
                         active_lesson=active,
+                        confidence=retry_confidence,
                     )
                     retry_results[retry.question_id] = result.is_correct
                     st.rerun()
@@ -787,6 +959,7 @@ def clear_authenticated_session() -> None:
 def main() -> None:
     settings = get_settings()
     st.set_page_config(page_title=settings.app_name, page_icon="🎌", layout="wide")
+    st.markdown(JAPANESE_STYLE, unsafe_allow_html=True)
     project_root = Path(__file__).resolve().parents[2]
     engine = create_database_engine(settings, project_root)
     st.sidebar.title(settings.app_name)
@@ -827,6 +1000,9 @@ def main() -> None:
                 settings.fallback_model,
                 settings.model_timeout_seconds,
                 settings.primary_model_timeout_seconds,
+                settings.hedge_after_seconds,
+                settings.parallel_explanations,
+                settings.explanation_workers,
             )
     profile = profile_service.get_profile(user_id)
     if profile is None:

@@ -13,10 +13,15 @@ from japanese_workplace_tutor.lesson import (
     REVIEW_ITEMS,
     REVIEW_QUESTIONS,
     RETRY_QUESTIONS,
+    AnswerConfidence,
+    FixtureQuestion,
+    ItemCategory,
     LessonService,
     LessonStateError,
     QuestionForm,
     ReviewOutcome,
+    SkillDimension,
+    display_options,
 )
 from japanese_workplace_tutor.models import (
     Base,
@@ -375,3 +380,107 @@ def test_database_excludes_replayable_fixture_content(tmp_path: Path) -> None:
         content for content in prohibited_content if content in database_dump
     ]
     assert leaked_content == []
+
+
+def test_display_options_are_stable_and_preserve_the_stored_option_set() -> None:
+    for question in (*FIXTURE_LESSON.questions, *RETRY_QUESTIONS.values()):
+        shuffled = display_options(question)
+        assert shuffled == display_options(question)
+        assert sorted(shuffled) == sorted(question.options)
+
+
+def test_display_options_break_the_fixed_correct_answer_position() -> None:
+    positions = {
+        display_options(question).index(
+            question.options[question.correct_option_index]
+        )
+        for question in (*FIXTURE_LESSON.questions, *RETRY_QUESTIONS.values())
+    }
+    assert positions != {0}
+
+
+def test_duplicate_question_options_are_rejected() -> None:
+    with pytest.raises(ValueError):
+        FixtureQuestion(
+            question_id="duplicate-options",
+            item_id="vocabulary:shinchoku",
+            form=QuestionForm.MEANING,
+            prompt="What does 進捗 mean?",
+            options=("Progress", "Progress", "Budget", "Agenda"),
+            correct_option_index=0,
+            explanation="進捗 describes how far work has progressed.",
+        )
+
+
+def test_a_guessed_correct_answer_earns_less_mastery(tmp_path: Path) -> None:
+    question = FIXTURE_LESSON.questions[0]
+    sure_path = tmp_path / "sure.db"
+    guessed_path = tmp_path / "guessed.db"
+
+    def answer(database_path: Path, confidence: AnswerConfidence) -> float:
+        auth, lessons, engine = create_services(database_path)
+        user = auth.register("Alice", "correct horse battery staple")
+        active = lessons.start_fixture_lesson(user.id)
+        lessons.submit_answer(
+            user.id,
+            active.lesson_session_id,
+            question.question_id,
+            question.correct_option_index,
+            confidence=confidence,
+        )
+        mastery = next(
+            record.mastery_score
+            for record in lessons.get_progress(user.id)
+            if record.item_id == question.item_id
+        )
+        engine.dispose()
+        return mastery
+
+    sure_mastery = answer(sure_path, AnswerConfidence.SURE)
+    guessed_mastery = answer(guessed_path, AnswerConfidence.GUESSED)
+
+    assert guessed_mastery < sure_mastery
+
+
+def test_answer_confidence_is_stored_with_the_attempt(tmp_path: Path) -> None:
+    database_path = tmp_path / "confidence.db"
+    auth, lessons, engine = create_services(database_path)
+    user = auth.register("Alice", "correct horse battery staple")
+    active = lessons.start_fixture_lesson(user.id)
+    question = FIXTURE_LESSON.questions[0]
+
+    lessons.submit_answer(
+        user.id,
+        active.lesson_session_id,
+        question.question_id,
+        question.correct_option_index,
+        confidence=AnswerConfidence.GUESSED,
+    )
+
+    with Session(engine) as session:
+        stored = session.scalars(select(ReviewAttempt)).all()
+    engine.dispose()
+
+    assert [attempt.answer_confidence for attempt in stored] == ["guessed"]
+
+
+def test_register_questions_score_as_contextual_use() -> None:
+    question = FixtureQuestion(
+        question_id="register-manager",
+        item_id="vocabulary:shinchoku",
+        form=QuestionForm.REGISTER,
+        prompt="Speaking to your manager, which phrasing fits?",
+        options=(
+            "進捗を共有いたします",
+            "進捗を共有するね",
+            "進捗を共有だよ",
+            "進捗を共有しとく",
+        ),
+        correct_option_index=0,
+        explanation="The humble form suits a manager.",
+    )
+
+    assert (
+        LessonService._skill_dimension(question, ItemCategory.VOCABULARY)
+        is SkillDimension.CONTEXTUAL_USE
+    )

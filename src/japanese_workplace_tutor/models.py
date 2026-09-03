@@ -136,8 +136,12 @@ class ReviewAttempt(Base):
             "user_id", "idempotency_key", name="uq_attempt_user_idempotency"
         ),
         CheckConstraint(
-            "question_form IN ('meaning', 'reading', 'contextual_cloze')",
+            "question_form IN ('meaning', 'reading', 'contextual_cloze', 'register')",
             name="ck_attempt_question_form",
+        ),
+        CheckConstraint(
+            "answer_confidence IN ('sure', 'guessed')",
+            name="ck_attempt_answer_confidence",
         ),
         CheckConstraint(
             "skill_dimension IN ('recognition', 'reading', 'contextual_use', "
@@ -161,6 +165,7 @@ class ReviewAttempt(Base):
     idempotency_key: Mapped[str] = mapped_column(String(64))
     question_form: Mapped[str] = mapped_column(String(32))
     skill_dimension: Mapped[str] = mapped_column(String(32))
+    answer_confidence: Mapped[str] = mapped_column(String(16), default="sure")
     is_correct: Mapped[bool] = mapped_column(Boolean())
     is_retry: Mapped[bool] = mapped_column(Boolean(), default=False)
     outcome: Mapped[str] = mapped_column(String(16))

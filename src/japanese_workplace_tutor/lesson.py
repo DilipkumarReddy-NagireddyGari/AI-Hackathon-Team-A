@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
 from math import ceil
+from random import Random
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -30,6 +31,12 @@ class QuestionForm(StrEnum):
     MEANING = "meaning"
     READING = "reading"
     CONTEXTUAL_CLOZE = "contextual_cloze"
+    REGISTER = "register"
+
+
+class AnswerConfidence(StrEnum):
+    SURE = "sure"
+    GUESSED = "guessed"
 
 
 class SkillDimension(StrEnum):
@@ -71,6 +78,22 @@ class FixtureQuestion(BaseModel):
     correct_option_index: int = Field(ge=0, le=3)
     explanation: str = Field(min_length=1)
 
+    @model_validator(mode="after")
+    def validate_options(self) -> "FixtureQuestion":
+        # Answers are resolved by option text, so duplicates would be ambiguous.
+        if len(set(self.options)) != len(self.options):
+            raise ValueError("Question options must be distinct.")
+        return self
+
+
+def display_options(question: FixtureQuestion) -> tuple[str, ...]:
+    """Shuffle option order for display only, keyed so Streamlit reruns stay stable."""
+
+    seed = int(sha256(question.question_id.encode("utf-8")).hexdigest()[:16], 16)
+    options = list(question.options)
+    Random(seed).shuffle(options)
+    return tuple(options)
+
 
 class LessonExplanationPoint(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -89,12 +112,6 @@ class LessonLineExplanation(BaseModel):
     kanji: tuple[LessonExplanationPoint, ...]
     vocabulary: tuple[LessonExplanationPoint, ...]
     grammar: tuple[LessonExplanationPoint, ...]
-
-    @model_validator(mode="after")
-    def require_japanese_explanation(self) -> "LessonLineExplanation":
-        if not (self.kanji or self.vocabulary or self.grammar):
-            raise ValueError("Every Japanese line needs at least one language explanation.")
-        return self
 
 
 class LessonContent(BaseModel):
@@ -648,6 +665,8 @@ class LessonService:
         review_session_id: str,
         question_id: str,
         selected_option_index: int,
+        *,
+        confidence: AnswerConfidence = AnswerConfidence.SURE,
     ) -> AttemptResult:
         question = self._find_question(
             (
@@ -666,6 +685,7 @@ class LessonService:
             selected_option_index,
             is_retry=False,
             require_due=True,
+            confidence=confidence,
         )
 
     def submit_answer(
@@ -676,6 +696,7 @@ class LessonService:
         selected_option_index: int,
         *,
         active_lesson: ActiveLesson | None = None,
+        confidence: AnswerConfidence = AnswerConfidence.SURE,
     ) -> AttemptResult:
         active = active_lesson or self._fixture_active(lesson_session_id)
         self._require_session(active, lesson_session_id)
@@ -692,6 +713,7 @@ class LessonService:
             selected_option_index,
             is_retry=False,
             lesson_item=lesson_item,
+            confidence=confidence,
         )
 
     def submit_retry_answer(
@@ -702,6 +724,7 @@ class LessonService:
         selected_option_index: int,
         *,
         active_lesson: ActiveLesson | None = None,
+        confidence: AnswerConfidence = AnswerConfidence.SURE,
     ) -> AttemptResult:
         active = active_lesson or self._fixture_active(lesson_session_id)
         self._require_session(active, lesson_session_id)
@@ -726,6 +749,7 @@ class LessonService:
             selected_option_index,
             is_retry=True,
             lesson_item=lesson_item,
+            confidence=confidence,
         )
 
     def _submit_question(
@@ -738,6 +762,7 @@ class LessonService:
         is_retry: bool,
         require_due: bool = False,
         lesson_item: FixtureItem | None = None,
+        confidence: AnswerConfidence = AnswerConfidence.SURE,
     ) -> AttemptResult:
         if selected_option_index not in range(len(question.options)):
             raise LessonStateError("Select one of the available answers.")
@@ -789,8 +814,18 @@ class LessonService:
             outcome = self._map_outcome(
                 progress, historical_attempts, question, lesson_session_id, is_correct, is_retry
             )
+            if outcome is ReviewOutcome.EASY and confidence is AnswerConfidence.GUESSED:
+                outcome = ReviewOutcome.GOOD
             skill_dimension = self._skill_dimension(question, fixture_item.category)
-            self._apply_policy(progress, historical_attempts, question, skill_dimension, outcome, now)
+            self._apply_policy(
+                progress,
+                historical_attempts,
+                question,
+                skill_dimension,
+                outcome,
+                now,
+                confidence,
+            )
             progress.last_answered_at = now
 
             attempt = ReviewAttempt(
@@ -800,6 +835,7 @@ class LessonService:
                 idempotency_key=idempotency_key,
                 question_form=question.form.value,
                 skill_dimension=skill_dimension.value,
+                answer_confidence=confidence.value,
                 is_correct=is_correct,
                 is_retry=is_retry,
                 outcome=outcome.value,
@@ -1026,6 +1062,8 @@ class LessonService:
     ) -> SkillDimension:
         if question.form is QuestionForm.READING:
             return SkillDimension.READING
+        if question.form is QuestionForm.REGISTER:
+            return SkillDimension.CONTEXTUAL_USE
         if question.form is QuestionForm.CONTEXTUAL_CLOZE:
             if category is ItemCategory.GRAMMAR:
                 return SkillDimension.GRAMMAR_APPLICATION
@@ -1073,16 +1111,23 @@ class LessonService:
         skill_dimension: SkillDimension,
         outcome: ReviewOutcome,
         now: datetime,
+        confidence: AnswerConfidence = AnswerConfidence.SURE,
     ) -> None:
         dimension_scores = dict(progress.dimension_scores or {})
         current_dimension = dimension_scores.get(skill_dimension.value, 0.0)
+        # A guessed correct answer is weaker evidence than a confident one.
+        damping = (
+            0.5
+            if confidence is AnswerConfidence.GUESSED and outcome is not ReviewOutcome.AGAIN
+            else 1.0
+        )
         dimension_scores[skill_dimension.value] = round(
-            min(1.0, max(0.0, current_dimension + self.DIMENSION_DELTAS[outcome])),
+            min(1.0, max(0.0, current_dimension + self.DIMENSION_DELTAS[outcome] * damping)),
             2,
         )
         progress.dimension_scores = dimension_scores
 
-        mastery = progress.mastery_score + self.MASTERY_DELTAS[outcome]
+        mastery = progress.mastery_score + self.MASTERY_DELTAS[outcome] * damping
         successful_forms = {
             attempt.question_form
             for attempt in historical_attempts

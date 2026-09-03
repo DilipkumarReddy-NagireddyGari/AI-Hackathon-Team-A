@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from japanese_workplace_tutor.auth import AuthenticationService
-from japanese_workplace_tutor.app import PAGE_RENDERERS
+from japanese_workplace_tutor.app import PAGE_RENDERERS, _furigana_html, _glossary
 from japanese_workplace_tutor.database import create_database_engine
 from japanese_workplace_tutor.generation import GeneratedQuiz
 from japanese_workplace_tutor.lesson import (
@@ -344,10 +344,15 @@ def test_generated_lesson_displays_the_llm_provider(monkeypatch, tmp_path: Path)
         caption.value == "Lesson generated with GPT-5 nano"
         for caption in app.caption
     )
+    assert any('lang="ja"' in markdown.value for markdown in app.markdown)
     assert any(
-        subheader.value == "Explanation" for subheader in app.subheader
+        "<ruby>進捗<rt>しんちょく</rt></ruby>" in markdown.value
+        for markdown in app.markdown
     )
-    assert any("進捗 (しんちょく)" in markdown.value for markdown in app.markdown)
+    assert any(
+        "進捗" in markdown.value and "しんちょく" in markdown.value
+        for markdown in app.markdown
+    )
 
 
 def test_generated_quiz_stays_hidden_until_go_to_quiz(monkeypatch, tmp_path: Path) -> None:
@@ -443,3 +448,96 @@ def test_incorrect_answer_shows_correction_and_requires_varied_retry(
 
     assert any("This counts as Hard" in success.value for success in app.success)
     assert app.button(key="complete_fixture_lesson")
+
+
+def test_rendered_options_are_shuffled_without_breaking_scoring(
+    monkeypatch, tmp_path: Path
+) -> None:
+    database_path = tmp_path / "app.db"
+    prepare_database(monkeypatch, database_path)
+    user = create_completed_user(database_path)
+    app = AppTest.from_file(str(PROJECT_ROOT / "app.py")).run()
+    app.session_state["authenticated_user_id"] = user.id
+    app.session_state["authenticated_username"] = user.username
+    app.run()
+
+    app.sidebar.radio[0].set_value("Learn").run()
+    app.button(key="start_fixture_lesson").click().run()
+    active = app.session_state["active_lesson"]
+
+    rendered_positions = set()
+    for question in FIXTURE_LESSON.questions:
+        answer_key = f"lesson_answer_{active.lesson_session_id}_{question.question_id}"
+        rendered = tuple(app.radio(key=answer_key).options)
+        assert sorted(rendered) == sorted(question.options)
+        rendered_positions.add(
+            rendered.index(question.options[question.correct_option_index])
+        )
+
+    assert rendered_positions != {0}
+
+    question = FIXTURE_LESSON.questions[0]
+    answer_key = f"lesson_answer_{active.lesson_session_id}_{question.question_id}"
+    app.radio(key=answer_key).set_value(
+        question.options[question.correct_option_index]
+    )
+    app.button(
+        key=f"submit_{active.lesson_session_id}_{question.question_id}"
+    ).click().run()
+
+    assert app.session_state["lesson_answer_results"][question.question_id] is True
+
+
+def test_furigana_escapes_model_supplied_html_and_builds_ruby() -> None:
+    point = LessonExplanationPoint(
+        expression="進捗",
+        reading="しんちょく",
+        meaning="work progress",
+        explanation="Reporting how far work has advanced.",
+    )
+
+    markup = _furigana_html("開発の進捗<script>alert(1)</script>", (point,))
+
+    assert "<ruby>進捗<rt>しんちょく</rt></ruby>" in markup
+    assert "<script>" not in markup
+    assert "&lt;script&gt;" in markup
+
+
+def test_furigana_escapes_a_malicious_reading() -> None:
+    point = LessonExplanationPoint(
+        expression="進捗",
+        reading='"><img src=x onerror=alert(1)>',
+        meaning="work progress",
+        explanation="Reporting how far work has advanced.",
+    )
+
+    markup = _furigana_html("進捗", (point,))
+
+    assert "<img" not in markup
+    assert "&lt;img" in markup
+
+
+def test_glossary_collapses_repeated_expressions() -> None:
+    point = LessonExplanationPoint(
+        expression="確認",
+        reading="かくにん",
+        meaning="confirmation",
+        explanation="Used when checking something.",
+    )
+    lines = tuple(
+        LessonLineExplanation(
+            japanese_text=f"確認します。{number}",
+            english_meaning="I will check.",
+            kanji=(),
+            vocabulary=(point,),
+            grammar=(),
+        )
+        for number in range(1, 4)
+    )
+
+    glossary = _glossary(lines)
+
+    assert len(glossary) == 1
+    label, entry, line_numbers = glossary[0]
+    assert (label, entry.expression) == ("Vocabulary", "確認")
+    assert line_numbers == [1, 2, 3]

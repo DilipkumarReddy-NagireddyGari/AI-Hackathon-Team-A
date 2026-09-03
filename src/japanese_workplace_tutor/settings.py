@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     fallback_model: str | None = None
     model_timeout_seconds: float = 180.0
     primary_model_timeout_seconds: float = 150.0
+    # None keeps the strictly sequential primary-then-fallback route.
+    hedge_after_seconds: float | None = None
+    # Trades more provider requests for lower wall-clock latency.
+    parallel_explanations: bool = False
+    explanation_workers: int = 4
 
     @property
     def model_configured(self) -> bool:

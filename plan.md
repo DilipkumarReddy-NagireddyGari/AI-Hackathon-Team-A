@@ -38,6 +38,7 @@ This is a living execution record. After every task, update its status here and 
 | T05 — Evidence-based mastery and retry | **Executed** | 2026-08-31 | 29 full-suite tests passed; live all-wrong/recovery walkthrough passed; see T05 Implementation Result and [verification record](docs/t05-verification.md) |
 | T06 — Due-item review experience | **Executed** | 2026-09-01 | 32 full-suite tests passed; live seven-due/skip/five-item-review/post-review walkthrough passed; see T06 Implementation Result and [verification record](docs/t06-verification.md) |
 | T07 — Generated scenario lessons | **Executed** | 2026-09-01 | 54 full-suite tests passed; live content-first generation completed in 50.4s and background grounded quiz output validated; see T07 Implementation Result and [verification record](docs/t07-verification.md) |
+| T07.1 — Lesson/quiz quality and latency hardening | **Executed** | 2026-09-03 | 82 full-suite tests passed; adds Alembic `20260903_0006`; see T07 Post-execution enhancements |
 | T08 — Personalized surprise lessons | Not started | — | Update after T08 execution |
 | T09 — Adaptive lesson presentation | Not started | — | Update after T09 execution |
 | T10 — Progress dashboard | Not started | — | Update after T10 execution |
@@ -752,6 +753,62 @@ Show one real/provider-configured lesson if available plus deterministic fallbac
 2. Provider display is a friendly route name only. Future LLM-generated translation, placement, surprise lesson, and document-lesson surfaces must carry and render the same successful-provider metadata.
 3. Generated lesson content must remain attached to the active session definition because replayable prompts and answer text are intentionally absent from SQLite.
 4. T08 can reuse `LessonGenerationService` after deterministic topic selection; it must not move topic choice, mastery, or schedules into model output.
+
+#### Post-execution enhancements (2026-09-03)
+
+Executed after T07 acceptance, on top of the delivered generation boundary. Grouped in five independently shippable phases. Full automated suite after all phases: **82 passed**; `git diff --check` clean.
+
+**1. Quiz answer integrity**
+
+- Fixed a genuine answer-position defect: nothing shuffled options and every fixture question stored its answer at index 0, so the first option was almost always correct.
+- Added `display_options()`, a deterministic shuffle seeded from `question_id` so order is stable across Streamlit reruns. Applied to lesson questions, corrective retries, and due review.
+- Scoring is unchanged and still resolves through the stored `correct_option_index`. The application already converted answers with `question.options.index(...)`, so shuffling the display list alone was sufficient and no service signature changed.
+- Added an option-uniqueness validator to `FixtureQuestion`, required because answers are resolved by option text.
+- Added distractor rules to `_validate_quiz_contract` only, never to `FixtureQuestion`: reading questions must offer four kana-only options, and the longest option may not exceed five times the shortest. Fixture data would fail a stricter length rule, so the strict rules deliberately apply to generated quizzes alone.
+- A substring-overlap rule from the original design was dropped: it rejects legitimate pairs such as 進 and 進捗, and each false rejection costs a full repair round trip. That guidance moved into the quiz prompt instead.
+
+**2. Generation latency**
+
+- Line explanations now cover an expression only on its first occurrence. `_dedupe_line_explanations` enforces this in the application regardless of model compliance, so particles such as は and です are no longer re-explained on every line.
+- Relaxed the "every line needs at least one language point" validators on both `GeneratedLine` and `LessonLineExplanation`, which previously made first-occurrence explanation impossible.
+- Capped `GeneratedLanguagePoint.explanation` at 240 characters.
+- Dialogue length now follows the learner level: N5 six lines, N4 eight, N3 ten. The count is plumbed through `_content_system_prompt`, `_finalize_content`, `_validate_content_mode`, and `_validate_generated_conversation`, all of which previously hardcoded ten.
+- Added hedged fallback via `_race_first_attempts`: when the primary route has not answered within `JLT_HEDGE_AFTER_SECONDS`, the fallback starts beside it and the first validating response wins. A stalled primary previously consumed the full 150-second timeout before the fallback was tried.
+- Hedging defaults to disabled, preserving the strictly sequential route and leaving the existing order-asserting transport tests untouched.
+
+**3. Lesson presentation and kanji**
+
+- Replaced the flat explanation dump with Conversation, Line breakdown, and Glossary tabs, and removed the "No kanji to explain in this line" filler.
+- Added furigana as `<ruby>` markup built by `_furigana_html`, with a per-lesson toggle. Every model-supplied substring and reading passes through `html.escape()` first; this is the security-critical part of the change because the markup requires `unsafe_allow_html` over untrusted model output. Two tests assert that a `<script>` payload and a malicious `reading` are both neutralised.
+- Added Japanese typography with `lang="ja"`, which stops browsers selecting a Chinese font for CJK-unified glyphs on Windows.
+- Added a Show English toggle, defaulted off, so learners read the Japanese first.
+- Quiz target items now carry a visible badge in the lesson, aligning study attention with what is actually tested.
+
+**4. Quiz framing depth**
+
+- Added Alembic revision `20260903_0006`. This supersedes the T07 statement above that T07 adds no migration; that statement was accurate at T07 execution time. Upgrade, downgrade, and re-upgrade were verified against a scratch database.
+- Added `QuestionForm.REGISTER` for politeness-level questions, mapped to `SkillDimension.CONTEXTUAL_USE`. The migration rebuilds the `ck_attempt_question_form` CHECK constraint, which previously pinned three forms.
+- Added `ReviewAttempt.answer_confidence`. A guessed correct answer takes half the mastery and dimension delta and can never reach EASY, so a lucky guess no longer schedules an item as well-known.
+- Contextual cloze questions now show the lesson line they came from, using the item's existing exact-source example.
+- Corrective retries now teach before re-testing by showing the missed question's explanation above the retry.
+
+**5. Parallel line explanations**
+
+- Added `_generate_split_content`: one dialogue call, then one concurrent call per line on a bounded worker pool, mirroring the existing background quiz executor.
+- The split path reassembles a `GeneratedConversationResponse` before handing off, so passage canonicalisation, target selection, mode contracts, scoring, and persistence are byte-identical to the single-call route.
+- Gated behind `JLT_PARALLEL_EXPLANATIONS`, defaulted off, because it multiplies provider requests roughly tenfold and carries rate-limit and cost risk.
+
+**New configuration**
+
+All optional and defaulted to prior behaviour: `JLT_HEDGE_AFTER_SECONDS`, `JLT_PARALLEL_EXPLANATIONS`, `JLT_EXPLANATION_WORKERS`. Documented in `.env.example`.
+
+**Handoff notes**
+
+1. `display_options()` is display-only. Any future question surface must render through it and must keep resolving answers against the stored option order, never the rendered order.
+2. Strict distractor rules belong to generated packages. Adding them to `FixtureQuestion` would invalidate the shipped fixture lesson.
+3. Both hedging and parallel explanations remain off until measured against the live proxy. Neither has been validated against real provider rate limits.
+4. The test helper `profile()` in `tests/test_generation.py` now defaults to N3, because an N4 profile demands eight lines and would invalidate every existing ten-line payload.
+5. Any new `QuestionForm` member requires a migration, since the form is constrained by a database CHECK rather than an application enum alone.
 
 ## Task T08 — Personalized surprise lessons
 

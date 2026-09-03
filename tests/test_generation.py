@@ -2,6 +2,8 @@ import json
 import logging
 from pathlib import Path
 import sqlite3
+from threading import Lock
+from time import sleep
 
 import pytest
 
@@ -17,6 +19,7 @@ from japanese_workplace_tutor.generation import (
     ScenarioMode,
     _canonical_item_id,
     detect_scenario_mode,
+    expected_line_count,
 )
 from japanese_workplace_tutor.lesson import LessonService
 from japanese_workplace_tutor.lesson import ItemCategory, ProgressRecord
@@ -305,13 +308,13 @@ class FakeResponse:
         return {"choices": [{"message": {"content": "{}"}}]}
 
 
-def profile() -> ProfileRecord:
+def profile(level: JapaneseLevel = JapaneseLevel.N3) -> ProfileRecord:
     return ProfileRecord(
         user_id=1,
         role="Software engineer",
         tasks=("Discuss requirements",),
         tools_domain=None,
-        declared_level=JapaneseLevel.N4,
+        declared_level=level,
         estimated_working_level=None,
         level_source=LevelSource.SELF_REPORTED,
         level_confidence=1.0,
@@ -323,6 +326,31 @@ def generator(transport: FakeTransport) -> LessonGenerationService:
     return LessonGenerationService(
         transport, "tsuzumi-id", "gpt-id", primary_timeout_seconds=45.0
     )
+
+
+class HedgeTransport:
+    """Thread-safe fake with per-model delays, so hedging can be exercised deterministically."""
+
+    def __init__(self, responses: dict[str, tuple[float, object]]) -> None:
+        self.responses = responses
+        self.calls: list[str] = []
+        self._lock = Lock()
+
+    def generate(
+        self,
+        model_id: str,
+        system_prompt: str,
+        user_prompt: str,
+        response_schema: dict[str, object] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        with self._lock:
+            self.calls.append(model_id)
+        delay, response = self.responses[model_id]
+        sleep(delay)
+        if isinstance(response, Exception):
+            raise response
+        return str(response)
 
 
 def test_transport_uses_low_reasoning_only_for_gpt5_models() -> None:
@@ -511,7 +539,7 @@ def test_split_contracts_reject_missing_lines_and_unknown_quiz_items() -> None:
     content_package = LessonGenerationService._normalized_content_package(
         content_package, scenario_input
     )
-    with pytest.raises(ValueError, match="exactly ten"):
+    with pytest.raises(ValueError, match="exactly 10 dialogue lines"):
         LessonGenerationService._validate_content_mode(
             content_package, scenario_input
         )
@@ -745,7 +773,7 @@ def test_content_prompt_requires_atomic_targets_copied_from_explanations() -> No
     assert "Japanese Title — English Translation" in prompt
     assert "Invent exactly two random speaker names" in prompt
     assert "japanese_speaker_name is a Japanese personal name written in kanji" in prompt
-    assert "Write exactly ten dialogue lines forming five exchanges" in prompt
+    assert "Write exactly 10 dialogue lines forming 5 exchanges" in prompt
     assert "Nameさん: Japanese dialogue" in prompt
     assert "JLPT LEVEL - STRICT REQUIREMENT" in prompt
     assert "never a sentence or utterance" in prompt
@@ -759,10 +787,210 @@ def test_explain_content_prompt_preserves_the_supplied_japanese_text() -> None:
     assert "Never add, rewrite, correct, extend, or merge Japanese sentences" in prompt
     assert "japanese_speaker_name" not in prompt
 
+
+def test_dialogue_length_follows_the_learner_level() -> None:
+    assert expected_line_count(profile(JapaneseLevel.N5)) == 6
+    assert expected_line_count(profile(JapaneseLevel.N4)) == 8
+    assert expected_line_count(profile(JapaneseLevel.N3)) == 10
+
+    prompt = LessonGenerationService._content_system_prompt(ScenarioMode.GENERATE, 6)
+
+    assert "Write exactly 6 dialogue lines forming 3 exchanges" in prompt
+
+
+def test_a_ten_line_dialogue_is_rejected_for_a_shorter_level() -> None:
+    transport = FakeTransport([json.dumps(conversation_payload())] * 4)
+
+    with pytest.raises(GenerationError):
+        generator(transport).generate_lesson_content(
+            "Clarify a requirement", ScenarioMode.GENERATE, profile(JapaneseLevel.N4)
+        )
+
+
+def test_repeated_expressions_are_explained_only_on_their_first_line() -> None:
+    transport = FakeTransport([json.dumps(conversation_payload())])
+
+    draft = generator(transport).generate_lesson_content(
+        "Clarify a requirement", ScenarioMode.GENERATE, profile()
+    )
+
+    explained = [
+        (category, point.expression)
+        for line in draft.line_explanations
+        for category, points in (
+            ("kanji", line.kanji),
+            ("vocabulary", line.vocabulary),
+            ("grammar", line.grammar),
+        )
+        for point in points
+    ]
+
+    assert len(explained) == len(set(explained))
+    # The payload repeats 確認 and 〜ます on every line after the first.
+    assert any(
+        not (line.kanji or line.vocabulary or line.grammar)
+        for line in draft.line_explanations
+    )
+
+
+def test_reading_questions_must_offer_kana_only_options() -> None:
+    payload = quiz_payload()
+    for question in payload["questions"]:
+        if question["form"] == "reading":
+            question["options"] = ["かくにん", "確認", "こうにん", "こうじん"]
+    package = GeneratedQuizPackage.model_validate(payload)
+    lesson = GeneratedLessonContentPackage.model_validate(content_payload()).lesson
+
+    with pytest.raises(ValueError, match="kana-only options"):
+        LessonGenerationService._validate_quiz_contract(package, lesson)
+
+
+def test_options_of_wildly_different_length_are_rejected() -> None:
+    payload = quiz_payload()
+    payload["questions"][0]["options"] = [
+        "The written specification agreed with the whole project team",
+        "Schedule",
+        "Meeting",
+        "Report",
+    ]
+    package = GeneratedQuizPackage.model_validate(payload)
+    lesson = GeneratedLessonContentPackage.model_validate(content_payload()).lesson
+
+    with pytest.raises(ValueError, match="comparable in length"):
+        LessonGenerationService._validate_quiz_contract(package, lesson)
+
+
+def test_hedging_starts_the_fallback_while_the_primary_is_slow() -> None:
+    transport = HedgeTransport(
+        {
+            "tsuzumi-id": (0.5, json.dumps(conversation_payload())),
+            "gpt-id": (0.0, json.dumps(conversation_payload())),
+        }
+    )
+    service = LessonGenerationService(
+        transport, "tsuzumi-id", "gpt-id", hedge_after_seconds=0.05
+    )
+
+    draft = service.generate_lesson_content(
+        "Clarify a requirement", ScenarioMode.GENERATE, profile()
+    )
+
+    assert draft.provider_name == "GPT-5 nano"
+    assert transport.calls == ["tsuzumi-id", "gpt-id"]
+
+
+def test_hedging_never_calls_the_fallback_when_the_primary_answers_first() -> None:
+    transport = HedgeTransport(
+        {"tsuzumi-id": (0.0, json.dumps(conversation_payload()))}
+    )
+    service = LessonGenerationService(
+        transport, "tsuzumi-id", "gpt-id", hedge_after_seconds=5.0
+    )
+
+    draft = service.generate_lesson_content(
+        "Clarify a requirement", ScenarioMode.GENERATE, profile()
+    )
+
+    assert draft.provider_name == "Tsuzumi 2"
+    assert transport.calls == ["tsuzumi-id"]
+
+
+def test_a_fast_primary_failure_does_not_wait_for_the_hedge_window() -> None:
+    transport = HedgeTransport(
+        {
+            "tsuzumi-id": (0.0, TimeoutError()),
+            "gpt-id": (0.0, json.dumps(conversation_payload())),
+        }
+    )
+    service = LessonGenerationService(
+        transport, "tsuzumi-id", "gpt-id", hedge_after_seconds=30.0
+    )
+
+    draft = service.generate_lesson_content(
+        "Clarify a requirement", ScenarioMode.GENERATE, profile()
+    )
+
+    assert draft.provider_name == "GPT-5 nano"
+    assert transport.calls == ["tsuzumi-id", "gpt-id"]
+
+
+class SplitTransport:
+    """Answers the dialogue call once, then the matching per-line explanation call."""
+
+    def __init__(self, dialogue: str, explanations: dict[str, str]) -> None:
+        self.dialogue = dialogue
+        self.explanations = explanations
+        self.system_prompts: list[str] = []
+        self._lock = Lock()
+
+    def generate(
+        self,
+        model_id: str,
+        system_prompt: str,
+        user_prompt: str,
+        response_schema: dict[str, object] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        with self._lock:
+            self.system_prompts.append(system_prompt)
+        if "explain one Japanese sentence" not in system_prompt:
+            return self.dialogue
+        line = user_prompt.split("<japanese_line>\n", 1)[1].split("\n</japanese_line>")[0]
+        return self.explanations[line]
+
+
+def dialogue_payload() -> dict[str, object]:
+    payload = conversation_payload()
+    payload["lines"] = [{"japanese_text": text} for text in DIALOGUE_TEXTS]
+    return payload
+
+
+def line_explanation_payloads() -> dict[str, str]:
+    payloads = {}
+    for index, text in enumerate(DIALOGUE_TEXTS):
+        line = generated_line(index, text)
+        del line["japanese_text"]
+        payloads[text] = json.dumps(line)
+    return payloads
+
+
+def test_parallel_explanations_build_the_same_validated_package() -> None:
+    transport = SplitTransport(
+        json.dumps(dialogue_payload()), line_explanation_payloads()
+    )
+    service = LessonGenerationService(
+        transport, "tsuzumi-id", "gpt-id", parallel_explanations=True
+    )
+
+    draft = service.generate_lesson_content(
+        "Clarify a requirement", ScenarioMode.GENERATE, profile()
+    )
+
+    assert draft.content.passage == VALID_PAYLOAD["lesson"]["passage"]
+    assert 3 <= len(draft.content.items) <= 7
+    assert len(draft.line_explanations) == len(DIALOGUE_TEXTS)
+    # One dialogue call plus one call per line.
+    assert len(transport.system_prompts) == len(DIALOGUE_TEXTS) + 1
+    assert any(
+        "Do not explain any language" in prompt for prompt in transport.system_prompts
+    )
+
+
+def test_the_split_path_is_off_unless_enabled() -> None:
+    transport = FakeTransport([json.dumps(conversation_payload())])
+
+    draft = generator(transport).generate_lesson_content(
+        "Clarify a requirement", ScenarioMode.GENERATE, profile()
+    )
+
+    assert transport.calls == ["tsuzumi-id"]
+    assert len(draft.line_explanations) == len(DIALOGUE_TEXTS)
+
+
 def test_user_prompt_makes_jlpt_level_strict_without_stretch_content() -> None:
     prompt = LessonGenerationService._user_prompt(
         ScenarioInput(scenario="Nomikai small talk", mode=ScenarioMode.GENERATE),
-        profile(),
+        profile(JapaneseLevel.N4),
         (),
         (),
     )
@@ -778,7 +1006,7 @@ def test_user_prompt_makes_jlpt_level_strict_without_stretch_content() -> None:
         (lambda payload: payload["lesson"].update(title="English only"), "Japanese Title"),
         (
             lambda payload: payload["line_explanations"].pop(),
-            "exactly ten dialogue lines",
+            "exactly 10 dialogue lines",
         ),
         (
             lambda payload: [
