@@ -19,6 +19,7 @@ def test_missing_model_settings_are_safe(monkeypatch) -> None:
 
     assert settings.model_configured is False
     assert settings.model_status == "Not configured"
+    assert settings.model_timeout_seconds == 180.0
 
 
 def test_complete_model_settings_report_presence_without_secret(monkeypatch) -> None:

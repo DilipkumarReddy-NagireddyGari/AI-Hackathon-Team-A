@@ -37,7 +37,7 @@ This is a living execution record. After every task, update its status here and 
 | T04 — Deterministic first lesson loop | **Executed and accepted** | 2026-08-31 | 26 full-suite tests passed; live mixed-answer lesson/restart/retention walkthrough passed; see T04 Implementation Result and [verification record](docs/t04-verification.md) |
 | T05 — Evidence-based mastery and retry | **Executed** | 2026-08-31 | 29 full-suite tests passed; live all-wrong/recovery walkthrough passed; see T05 Implementation Result and [verification record](docs/t05-verification.md) |
 | T06 — Due-item review experience | **Executed** | 2026-09-01 | 32 full-suite tests passed; live seven-due/skip/five-item-review/post-review walkthrough passed; see T06 Implementation Result and [verification record](docs/t06-verification.md) |
-| T07 — Generated scenario lessons | Not started | — | Update after T07 execution |
+| T07 — Generated scenario lessons | **Executed** | 2026-09-01 | 54 full-suite tests passed; live content-first generation completed in 50.4s and background grounded quiz output validated; see T07 Implementation Result and [verification record](docs/t07-verification.md) |
 | T08 — Personalized surprise lessons | Not started | — | Update after T08 execution |
 | T09 — Adaptive lesson presentation | Not started | — | Update after T09 execution |
 | T10 — Progress dashboard | Not started | — | Update after T10 execution |
@@ -696,13 +696,13 @@ T05. T06 is recommended but not required for scenario generation.
 - Supply fake adapters/fixtures for success, timeout, malformed JSON, invalid answer key, fallback, and total-failure tests.
 
 **Acceptance Criteria:**
-- [ ] English and Japanese scenarios show an explicit detected/default mode that the user can confirm/change.
-- [ ] A valid generated lesson meets structural limits and completes through deterministic scoring.
-- [ ] Invalid/partial model output is never rendered or scored.
-- [ ] Tsuzumi technical/validation failure triggers one Tsuzumi repair/retry, then GPT fallback if still invalid.
-- [ ] Merely weak style does not trigger fallback.
-- [ ] Total failure preserves scenario input, shows safe retry, and changes no progress.
-- [ ] Normal UI does not expose provider/model implementation details.
+- [x] English and Japanese scenarios show an explicit detected/default mode that the user can confirm/change.
+- [x] A valid generated lesson meets structural limits and completes through deterministic scoring.
+- [x] Invalid/partial model output is never rendered or scored.
+- [x] Tsuzumi technical/validation failure triggers one Tsuzumi repair/retry, then GPT fallback if still invalid.
+- [x] Merely weak style does not trigger fallback.
+- [x] Total failure preserves scenario input, shows safe retry, and changes no progress.
+- [x] Generated content identifies the successful LLM as Tsuzumi or GPT without exposing model IDs, endpoints, prompts, responses, or credentials. This intentionally supersedes the original hidden-provider criterion per the T07 execution request.
 
 **Verification:**
 1. Generate and finish one English-scenario lesson and one Japanese-scenario lesson.
@@ -721,6 +721,37 @@ Show one real/provider-configured lesson if available plus deterministic fallbac
 - Uniform model-quality evaluation and stylistic fallback.
 - Document upload/source spans.
 - Learner-visible model selection.
+
+### T07 Implementation Result
+
+**Execution status:** **Executed on 2026-09-01.** The validated generation boundary, provider policy, scenario UI, existing-loop integration, automated checks, and live provider walkthrough are complete. The configured Tsuzumi 2 route currently fails upstream, while GPT-5 nano succeeds through the application fallback.
+
+#### Delivered implementation
+
+- Added strict scenario input and generated lesson package schemas, including item/question limits, unique IDs, canonical references, bounded answer keys, four-option MCQs, and one varied retry per question.
+- Added an OpenAI-compatible transport and policy-owned Tsuzumi call, one Tsuzumi repair/retry, then GPT fallback. Operational logs contain provider/model, attempt, status, latency, and fallback reason without content or credentials.
+- Added English/Japanese mode detection with an explicit learner-confirmed mode control. Scenario input remains present after total failure.
+- Generalized the active lesson boundary so validated generated items, questions, retries, scoring, mastery, SM-2 schedules, and completion metadata use the existing deterministic service.
+- Added **Generated with Tsuzumi 2** or **Generated with GPT-5 nano** beside generated lesson content, reflecting the provider that returned the validated lesson.
+- Added a configurable 90-second per-attempt timeout and one GPT validation-repair attempt. A measured full GPT-5 nano lesson took 56.8 seconds, exceeding the original 45-second limit.
+- Kept generated scenario and lesson content session-only. SQLite retains only canonical item/progress/evidence fields and minimal completion metadata.
+
+#### Verification evidence
+
+- Full automated suite: **41 passed**.
+- Focused T07 generation suite: **7 passed**; focused generation/UI suite: **16 passed** before final additions.
+- Fake transports proved direct Tsuzumi success, repaired Tsuzumi success, GPT fallback after two invalid primary outputs, and safe total failure.
+- English and Japanese mode paths, out-of-range answer keys, canonical references, varied retries, deterministic completion, provider labels, safe logs, and generated-content retention were checked.
+- Live proxy diagnostics showed Tsuzumi 2 returning HTTP 500 for an upstream connection error. GPT-5 nano returned HTTP 200 and the complete application fallback produced a validated 4-item, 4-question lesson labeled **GPT-5 nano** after the timeout fix.
+- T07 adds no migration; Alembic head remains `20260831_0005`.
+- Detailed evidence is recorded in [docs/t07-verification.md](docs/t07-verification.md).
+
+#### Important findings and handoff
+
+1. Current Tsuzumi 2 availability is an upstream proxy/provider concern: the configured route returns HTTP 500 before content generation. GPT-5 nano is operational as the fallback.
+2. Provider display is a friendly route name only. Future LLM-generated translation, placement, surprise lesson, and document-lesson surfaces must carry and render the same successful-provider metadata.
+3. Generated lesson content must remain attached to the active session definition because replayable prompts and answer text are intentionally absent from SQLite.
+4. T08 can reuse `LessonGenerationService` after deterministic topic selection; it must not move topic choice, mastery, or schedules into model output.
 
 ## Task T08 — Personalized surprise lessons
 

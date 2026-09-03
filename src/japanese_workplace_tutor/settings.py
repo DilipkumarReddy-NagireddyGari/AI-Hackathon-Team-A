@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     model_api_key: SecretStr | None = None
     primary_model: str | None = None
     fallback_model: str | None = None
+    model_timeout_seconds: float = 180.0
+    primary_model_timeout_seconds: float = 150.0
 
     @property
     def model_configured(self) -> bool:

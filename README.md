@@ -1,6 +1,6 @@
 # Japanese Workplace Learning
 
-T06 provides a safe, local Streamlit application with persistent demo accounts, user-scoped learner profiles, a deterministic workplace lesson, compact evidence-based mastery, and a skippable due-item review workflow. Model calls are not implemented yet.
+T07 provides a safe, local Streamlit application with persistent demo accounts, user-scoped learner profiles, validated generated scenario lessons, compact evidence-based mastery, and a skippable due-item review workflow.
 
 ## Requirements
 
@@ -15,7 +15,7 @@ From PowerShell in the project root:
 2. Install locked direct and development dependencies: `.venv\Scripts\python -m pip install -r requirements-dev.txt`
 3. Establish the migration baseline: `.venv\Scripts\python -m alembic upgrade head`
 
-No model credentials are required. To exercise the configured status only, copy `.env.example` to `.env` and replace every model placeholder with non-production dummy values. Do not commit `.env`.
+Model credentials are optional for fixture lessons and non-model features. To generate scenario lessons, copy `.env.example` to `.env` and provide the OpenAI-compatible endpoint, shared credential, primary Tsuzumi model ID, and fallback GPT model ID. Do not commit `.env`.
 
 ## Run
 
@@ -23,7 +23,7 @@ Start the app with one command:
 
 `.venv\Scripts\python -m streamlit run app.py`
 
-Open the URL shown by Streamlit. Register a local demo account without an email address, complete the required learner profile, then open Learn to complete the fixture lesson and Progress to inspect saved evidence. The startup health panel reports only:
+Open the URL shown by Streamlit. Register a local demo account without an email address, complete the required learner profile, then open Learn to generate a scenario lesson or complete the offline fixture lesson. Progress shows saved evidence. The startup health panel reports only:
 
 - whether the database is ready;
 - whether SQLite foreign-key enforcement is enabled; and
@@ -63,6 +63,22 @@ It never displays setting values. If model settings are absent, all non-model pa
 - Each submission is idempotent for the user, review session, and question. Immediate feedback shows the mapped outcome and new review date.
 - Completing a review returns Home, reports the result, shows the earliest remaining review schedule, and refreshes the due count. Review prompts and feedback remain session-only and are not stored in SQLite.
 
+## Generated scenario lessons
+
+- Learn accepts an optional workplace situation or goal, or Japanese text up to 4,000 characters. English defaults to **Generate a lesson from this scenario** and Japanese defaults to **Explain this Japanese text**; the learner confirms or changes the mode before generation. A blank Generate-mode request creates a varied surprise workplace lesson and avoids recently completed topic IDs.
+- For scenario generation, the scenario's technical, general, or social subject outranks the learner's role and tasks. Role data adjusts relationships, register, and difficulty without injecting technical content into a general or social situation. Generated passages are actual multi-turn, speaker-labelled workplace conversations rather than lesson descriptions.
+- Explain mode preserves the supplied Japanese text exactly. It cannot rewrite, correct, extend, or add Japanese sentences, and target-item examples must reuse exact source lines.
+- Every generated passage line has a visible line-by-line English meaning plus structured kanji, vocabulary, and grammar explanations. The content response must pass a strict Pydantic schema requiring complete ordered line coverage and 3-7 Japanese target items drawn from those explanations before anything renders.
+- Quizzes test Japanese kanji, vocabulary, and grammar used in the passage, never English words merely present in it. The prompt includes compact prior item evidence and the learner's working JLPT level so weak items can be reinforced, mastered items are not over-tested, and stretch content remains supported.
+- The application treats scenario text as untrusted content and sends the learner profile, compact learning evidence, and recent topic IDs separately.
+- Lesson content renders as soon as it validates. A separate in-memory background job immediately prepares 4-6 grounded questions and their varied retries while the learner studies. **Go to quiz** reveals and activates the quiz only after the learner chooses it; a failed quiz job leaves the lesson available for retry.
+- Each phase calls the configured Tsuzumi route and falls back to GPT. Schema-validation failures receive one same-model repair; technical failures skip the redundant Tsuzumi repair and fall back immediately. HTTP connections are pooled across the content and quiz requests.
+- GPT-5 requests use low reasoning effort and strict JSON Schema output. Collection bounds and exact four-option requirements are represented directly in the provider schema; repair feedback is capped to avoid oversized retry prompts.
+- The UI separately displays **Lesson generated with Tsuzumi 2/GPT-5 nano** and **Quiz generated with Tsuzumi 2/GPT-5 nano**, based on the successful route for each phase. Model IDs, endpoints, credentials, prompts, responses, and failure details are not shown.
+- Full lesson responses can take longer than short health probes, especially when every line is explained. `JLT_MODEL_TIMEOUT_SECONDS` defaults to 180 seconds and can be adjusted for the configured proxy without changing provider code.
+- Opening validated content records exposure once. Promoting its validated quiz does not record exposure again, and answers use the same application-owned scoring, corrective retry, mastery, SM-2, idempotency, and minimal completion-metadata path as the fixture lesson. Model output cannot set progress or schedules.
+- Generated passage, examples, prompts, options, explanations, feedback, recap, and scenario text remain in Streamlit session state only. Total provider failure preserves the scenario for retry and creates no exposure or progress rows.
+
 ### Mastery policy `t05-v1`
 
 - Evidence dimensions are recognition, reading, contextual use, and grammar application. Full question text and feedback are never persisted.
@@ -93,12 +109,13 @@ All settings use the `JLT_` environment prefix:
 | Variable | Required now | Purpose |
 |---|---:|---|
 | `JLT_DATABASE_URL` | No | SQLAlchemy URL; defaults to `sqlite:///data/app.db` |
-| `JLT_MODEL_BASE_URL` | No | Future OpenAI-compatible endpoint |
-| `JLT_MODEL_API_KEY` | No | Future model credential |
-| `JLT_PRIMARY_MODEL` | No | Future primary model ID |
-| `JLT_FALLBACK_MODEL` | No | Future fallback model ID |
+| `JLT_MODEL_BASE_URL` | For generation | OpenAI-compatible endpoint |
+| `JLT_MODEL_API_KEY` | For generation | Shared model credential |
+| `JLT_PRIMARY_MODEL` | For generation | Primary Tsuzumi model ID |
+| `JLT_FALLBACK_MODEL` | For generation | Fallback GPT model ID |
+| `JLT_MODEL_TIMEOUT_SECONDS` | No | Per-attempt provider timeout; defaults to 180 seconds |
 
-Model status is configured only when all four model variables are present. The current application never contacts a provider.
+Model status is configured only when all four model variables are present. Scenario generation is disabled when any value is absent; all offline features remain available.
 
 ## Database and migrations
 

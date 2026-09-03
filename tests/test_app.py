@@ -1,3 +1,4 @@
+from concurrent.futures import Future
 from datetime import datetime
 from pathlib import Path
 
@@ -10,7 +11,18 @@ from sqlalchemy.orm import Session
 from japanese_workplace_tutor.auth import AuthenticationService
 from japanese_workplace_tutor.app import PAGE_RENDERERS
 from japanese_workplace_tutor.database import create_database_engine
-from japanese_workplace_tutor.lesson import FIXTURE_LESSON, REVIEW_ITEMS, LessonService
+from japanese_workplace_tutor.generation import GeneratedQuiz
+from japanese_workplace_tutor.lesson import (
+    ActiveLesson,
+    ActiveLessonDraft,
+    FIXTURE_LESSON,
+    LessonContent,
+    LessonExplanationPoint,
+    LessonLineExplanation,
+    REVIEW_ITEMS,
+    RETRY_QUESTIONS,
+    LessonService,
+)
 from japanese_workplace_tutor.models import LearningItem, ReviewAttempt, UserItemProgress
 from japanese_workplace_tutor.profile import JapaneseLevel, ProfileService
 from japanese_workplace_tutor.settings import Settings, get_settings
@@ -262,11 +274,11 @@ def test_fixture_lesson_can_be_answered_completed_and_viewed_in_progress(
 
     app.sidebar.radio[0].set_value("Learn").run()
     app.button(key="start_fixture_lesson").click().run()
-    active = app.session_state["active_fixture_lesson"]
+    active = app.session_state["active_lesson"]
 
     for question in FIXTURE_LESSON.questions:
         answer_key = (
-            f"fixture_answer_{active.lesson_session_id}_{question.question_id}"
+            f"lesson_answer_{active.lesson_session_id}_{question.question_id}"
         )
         submit_key = f"submit_{active.lesson_session_id}_{question.question_id}"
         app.radio(key=answer_key).set_value(
@@ -276,7 +288,7 @@ def test_fixture_lesson_can_be_answered_completed_and_viewed_in_progress(
 
     app.button(key="complete_fixture_lesson").click().run()
     assert any("Lesson completed" in success.value for success in app.success)
-    assert "active_fixture_lesson" not in app.session_state
+    assert "active_lesson" not in app.session_state
 
     app.sidebar.radio[0].set_value("Progress").run(timeout=10)
     assert not app.exception
@@ -293,6 +305,96 @@ def test_fixture_lesson_can_be_answered_completed_and_viewed_in_progress(
     engine.dispose()
 
 
+def test_generated_lesson_displays_the_llm_provider(monkeypatch, tmp_path: Path) -> None:
+    database_path = tmp_path / "app.db"
+    prepare_database(monkeypatch, database_path)
+    user = create_completed_user(database_path)
+    app = AppTest.from_file(str(PROJECT_ROOT / "app.py")).run()
+    app.session_state["authenticated_user_id"] = user.id
+    app.session_state["authenticated_username"] = user.username
+    explanation_point = LessonExplanationPoint(
+        expression="進捗",
+        reading="しんちょく",
+        meaning="work progress",
+        explanation="A noun used when reporting how far work has advanced.",
+    )
+    app.session_state["active_lesson"] = ActiveLesson(
+        "generated-session",
+        FIXTURE_LESSON,
+        tuple(
+            RETRY_QUESTIONS[question.question_id]
+            for question in FIXTURE_LESSON.questions
+        ),
+        "GPT-5 nano",
+        (
+            LessonLineExplanation(
+                japanese_text="開発の進捗を共有します。",
+                english_meaning="I will share the development progress.",
+                kanji=(),
+                vocabulary=(explanation_point,),
+                grammar=(),
+            ),
+        ),
+    )
+    app.run()
+
+    app.sidebar.radio[0].set_value("Learn").run()
+
+    assert any(
+        caption.value == "Lesson generated with GPT-5 nano"
+        for caption in app.caption
+    )
+    assert any(
+        subheader.value == "Explanation" for subheader in app.subheader
+    )
+    assert any("進捗 (しんちょく)" in markdown.value for markdown in app.markdown)
+
+
+def test_generated_quiz_stays_hidden_until_go_to_quiz(monkeypatch, tmp_path: Path) -> None:
+    database_path = tmp_path / "app.db"
+    prepare_database(monkeypatch, database_path)
+    user = create_completed_user(database_path)
+    content = LessonContent(
+        topic_id=FIXTURE_LESSON.topic_id,
+        title=FIXTURE_LESSON.title,
+        difficulty=FIXTURE_LESSON.difficulty,
+        passage=FIXTURE_LESSON.passage,
+        items=FIXTURE_LESSON.items,
+        recap=FIXTURE_LESSON.recap,
+    )
+    draft = ActiveLessonDraft("draft-session", content, (), "GPT-5 nano")
+    future: Future[GeneratedQuiz] = Future()
+    future.set_result(
+        GeneratedQuiz(
+            FIXTURE_LESSON.questions,
+            tuple(
+                RETRY_QUESTIONS[question.question_id]
+                for question in FIXTURE_LESSON.questions
+            ),
+            "Tsuzumi 2",
+        )
+    )
+    app = AppTest.from_file(str(PROJECT_ROOT / "app.py")).run()
+    app.session_state["authenticated_user_id"] = user.id
+    app.session_state["authenticated_username"] = user.username
+    app.session_state["active_lesson_draft"] = draft
+    app.session_state["quiz_generation_future"] = future
+    app.run()
+
+    app.sidebar.radio[0].set_value("Learn").run()
+
+    assert app.button(key="go_to_quiz")
+    assert not any(subheader.value == "Practice" for subheader in app.subheader)
+    app.button(key="go_to_quiz").click().run()
+
+    assert any(subheader.value == "Practice" for subheader in app.subheader)
+    assert any(
+        caption.value == "Quiz generated with Tsuzumi 2"
+        for caption in app.caption
+    )
+    assert "active_lesson_draft" not in app.session_state
+
+
 def test_incorrect_answer_shows_correction_and_requires_varied_retry(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -306,11 +408,11 @@ def test_incorrect_answer_shows_correction_and_requires_varied_retry(
 
     app.sidebar.radio[0].set_value("Learn").run()
     app.button(key="start_fixture_lesson").click().run()
-    active = app.session_state["active_fixture_lesson"]
+    active = app.session_state["active_lesson"]
     failed_question = FIXTURE_LESSON.questions[0]
 
     for question in FIXTURE_LESSON.questions:
-        answer_key = f"fixture_answer_{active.lesson_session_id}_{question.question_id}"
+        answer_key = f"lesson_answer_{active.lesson_session_id}_{question.question_id}"
         selected_index = (
             1
             if question.question_id == failed_question.question_id
@@ -333,7 +435,7 @@ def test_incorrect_answer_shows_correction_and_requires_varied_retry(
     assert retry.item_id == failed_question.item_id
     assert retry.form != failed_question.form
 
-    retry_key = f"fixture_retry_{active.lesson_session_id}_{retry.question_id}"
+    retry_key = f"lesson_retry_{active.lesson_session_id}_{retry.question_id}"
     app.radio(key=retry_key).set_value(retry.options[retry.correct_option_index])
     app.button(
         key=f"submit_retry_{active.lesson_session_id}_{retry.question_id}"

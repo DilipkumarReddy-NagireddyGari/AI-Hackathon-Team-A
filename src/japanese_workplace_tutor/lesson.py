@@ -47,41 +47,86 @@ class ReviewOutcome(StrEnum):
 
 
 class FixtureItem(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     canonical_id: str = Field(min_length=1, max_length=128)
     category: ItemCategory
-    expression: str
-    reading: str
-    meaning: str
-    example: str
+    expression: str = Field(min_length=1)
+    reading: str = Field(min_length=1)
+    meaning: str = Field(min_length=1)
+    example: str = Field(min_length=1)
     jlpt_level: str | None
     jlpt_provenance: str
     jlpt_confidence: float = Field(ge=0.0, le=1.0)
 
 
 class FixtureQuestion(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     question_id: str = Field(min_length=1, max_length=64)
     item_id: str
     form: QuestionForm
-    prompt: str
-    options: tuple[str, str, str, str]
+    prompt: str = Field(min_length=1)
+    options: tuple[str, ...] = Field(min_length=4, max_length=4)
     correct_option_index: int = Field(ge=0, le=3)
-    explanation: str
+    explanation: str = Field(min_length=1)
+
+
+class LessonExplanationPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    expression: str = Field(min_length=1)
+    reading: str = Field(min_length=1)
+    meaning: str = Field(min_length=1)
+    explanation: str = Field(min_length=1)
+
+
+class LessonLineExplanation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    japanese_text: str = Field(min_length=1)
+    english_meaning: str = Field(min_length=1)
+    kanji: tuple[LessonExplanationPoint, ...]
+    vocabulary: tuple[LessonExplanationPoint, ...]
+    grammar: tuple[LessonExplanationPoint, ...]
+
+    @model_validator(mode="after")
+    def require_japanese_explanation(self) -> "LessonLineExplanation":
+        if not (self.kanji or self.vocabulary or self.grammar):
+            raise ValueError("Every Japanese line needs at least one language explanation.")
+        return self
+
+
+class LessonContent(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    topic_id: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=256)
+    difficulty: str = Field(min_length=1, max_length=128)
+    passage: str = Field(min_length=1)
+    items: tuple[FixtureItem, ...] = Field(min_length=3, max_length=7)
+    recap: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_items(self) -> "LessonContent":
+        item_ids = [item.canonical_id for item in self.items]
+        if not 3 <= len(item_ids) <= 7:
+            raise ValueError("A lesson must contain 3-7 target items.")
+        if len(item_ids) != len(set(item_ids)):
+            raise ValueError("Lesson item IDs must be unique.")
+        return self
 
 
 class FixtureLesson(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
-    topic_id: str
-    title: str
-    difficulty: str
-    passage: str
+    topic_id: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=256)
+    difficulty: str = Field(min_length=1, max_length=128)
+    passage: str = Field(min_length=1)
     items: tuple[FixtureItem, ...]
     questions: tuple[FixtureQuestion, ...]
-    recap: str
+    recap: str = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_lesson(self) -> "FixtureLesson":
@@ -354,6 +399,18 @@ class LessonStateError(ValueError):
 class ActiveLesson:
     lesson_session_id: str
     lesson: FixtureLesson
+    retry_questions: tuple[FixtureQuestion, ...]
+    provider_name: str | None = None
+    line_explanations: tuple[LessonLineExplanation, ...] = ()
+    quiz_provider_name: str | None = None
+
+
+@dataclass(frozen=True)
+class ActiveLessonDraft:
+    lesson_session_id: str
+    content: LessonContent
+    line_explanations: tuple[LessonLineExplanation, ...]
+    provider_name: str
 
 
 @dataclass(frozen=True)
@@ -439,9 +496,90 @@ class LessonService:
     def start_fixture_lesson(
         self, user_id: int, lesson_session_id: str | None = None
     ) -> ActiveLesson:
+        retries = tuple(RETRY_QUESTIONS[question.question_id] for question in FIXTURE_LESSON.questions)
+        return self._start_lesson(
+            user_id,
+            FIXTURE_LESSON,
+            retries,
+            lesson_session_id=lesson_session_id,
+        )
+
+    def start_generated_lesson(self, user_id: int, generated: object) -> ActiveLesson:
+        from .generation import GeneratedLesson
+
+        if not isinstance(generated, GeneratedLesson):
+            raise LessonStateError("A validated generated lesson is required.")
+        return self._start_lesson(
+            user_id,
+            generated.lesson,
+            generated.retry_questions,
+            provider_name=generated.provider_name,
+            line_explanations=generated.line_explanations,
+        )
+
+    def start_generated_lesson_draft(
+        self, user_id: int, generated: object
+    ) -> ActiveLessonDraft:
+        from .generation import GeneratedLessonDraft
+
+        if not isinstance(generated, GeneratedLessonDraft):
+            raise LessonStateError("A validated generated lesson draft is required.")
+        session_id = str(uuid4())
+        self._record_exposure(user_id, generated.content.items)
+        return ActiveLessonDraft(
+            session_id,
+            generated.content,
+            generated.line_explanations,
+            generated.provider_name,
+        )
+
+    def activate_generated_quiz(
+        self, draft: ActiveLessonDraft, generated_quiz: object
+    ) -> ActiveLesson:
+        from .generation import GeneratedQuiz
+
+        if not isinstance(generated_quiz, GeneratedQuiz):
+            raise LessonStateError("A validated generated quiz is required.")
+        content = draft.content
+        lesson = FixtureLesson(
+            topic_id=content.topic_id,
+            title=content.title,
+            difficulty=content.difficulty,
+            passage=content.passage,
+            items=content.items,
+            questions=generated_quiz.questions,
+            recap=content.recap,
+        )
+        return ActiveLesson(
+            draft.lesson_session_id,
+            lesson,
+            generated_quiz.retry_questions,
+            draft.provider_name,
+            draft.line_explanations,
+            generated_quiz.provider_name,
+        )
+
+    def _start_lesson(
+        self,
+        user_id: int,
+        lesson: FixtureLesson,
+        retry_questions: tuple[FixtureQuestion, ...],
+        *,
+        lesson_session_id: str | None = None,
+        provider_name: str | None = None,
+        line_explanations: tuple[LessonLineExplanation, ...] = (),
+    ) -> ActiveLesson:
         session_id = lesson_session_id or str(uuid4())
+        self._record_exposure(user_id, lesson.items)
+        return ActiveLesson(
+            session_id, lesson, retry_questions, provider_name, line_explanations
+        )
+
+    def _record_exposure(
+        self, user_id: int, items: tuple[FixtureItem, ...]
+    ) -> None:
         with Session(self._engine) as session:
-            for fixture_item in FIXTURE_LESSON.items:
+            for fixture_item in items:
                 self._ensure_item(session, fixture_item)
                 progress = self._get_progress(
                     session, user_id, fixture_item.canonical_id
@@ -456,7 +594,6 @@ class LessonService:
                 else:
                     progress.exposure_count += 1
             session.commit()
-        return ActiveLesson(session_id, FIXTURE_LESSON)
 
     def get_due_count(self, user_id: int) -> int:
         with Session(self._engine) as session:
@@ -537,16 +674,24 @@ class LessonService:
         lesson_session_id: str,
         question_id: str,
         selected_option_index: int,
+        *,
+        active_lesson: ActiveLesson | None = None,
     ) -> AttemptResult:
-        question = self._find_question(FIXTURE_LESSON.questions, question_id)
+        active = active_lesson or self._fixture_active(lesson_session_id)
+        self._require_session(active, lesson_session_id)
+        question = self._find_question(active.lesson.questions, question_id)
         if question is None:
             raise LessonStateError("This question is not part of the active lesson.")
+        lesson_item = next(
+            item for item in active.lesson.items if item.canonical_id == question.item_id
+        )
         return self._submit_question(
             user_id,
             lesson_session_id,
             question,
             selected_option_index,
             is_retry=False,
+            lesson_item=lesson_item,
         )
 
     def submit_retry_answer(
@@ -555,22 +700,32 @@ class LessonService:
         lesson_session_id: str,
         question_id: str,
         selected_option_index: int,
+        *,
+        active_lesson: ActiveLesson | None = None,
     ) -> AttemptResult:
-        question = self._find_question(RETRY_QUESTIONS.values(), question_id)
+        active = active_lesson or self._fixture_active(lesson_session_id)
+        self._require_session(active, lesson_session_id)
+        question = self._find_question(active.retry_questions, question_id)
         if question is None:
             raise LessonStateError("This retry is not part of the active lesson.")
         pending_ids = {
             retry.question_id
-            for retry in self.get_pending_retries(user_id, lesson_session_id)
+            for retry in self.get_pending_retries(
+                user_id, lesson_session_id, active_lesson=active
+            )
         }
         if question_id not in pending_ids:
             raise LessonStateError("This retry is not currently due.")
+        lesson_item = next(
+            item for item in active.lesson.items if item.canonical_id == question.item_id
+        )
         return self._submit_question(
             user_id,
             lesson_session_id,
             question,
             selected_option_index,
             is_retry=True,
+            lesson_item=lesson_item,
         )
 
     def _submit_question(
@@ -582,6 +737,7 @@ class LessonService:
         *,
         is_retry: bool,
         require_due: bool = False,
+        lesson_item: FixtureItem | None = None,
     ) -> AttemptResult:
         if selected_option_index not in range(len(question.options)):
             raise LessonStateError("Select one of the available answers.")
@@ -601,7 +757,7 @@ class LessonService:
                 progress = self._required_progress(session, user_id, existing.item_id)
                 return self._attempt_result(existing, question.question_id, progress, True)
 
-            fixture_item = next(
+            fixture_item = lesson_item or next(
                 item for item in REVIEW_ITEMS if item.canonical_id == question.item_id
             )
             self._ensure_item(session, fixture_item)
@@ -656,8 +812,14 @@ class LessonService:
             return self._attempt_result(attempt, question.question_id, progress, False)
 
     def get_pending_retries(
-        self, user_id: int, lesson_session_id: str
+        self,
+        user_id: int,
+        lesson_session_id: str,
+        *,
+        active_lesson: ActiveLesson | None = None,
     ) -> tuple[FixtureQuestion, ...]:
+        active = active_lesson or self._fixture_active(lesson_session_id)
+        self._require_session(active, lesson_session_id)
         with Session(self._engine) as session:
             attempts = session.scalars(
                 select(ReviewAttempt).where(
@@ -672,15 +834,37 @@ class LessonService:
         }
         retried_item_ids = {attempt.item_id for attempt in attempts if attempt.is_retry}
         return tuple(
-            RETRY_QUESTIONS[question.question_id]
-            for question in FIXTURE_LESSON.questions
+            retry
+            for question, retry in zip(
+                active.lesson.questions, active.retry_questions, strict=True
+            )
             if question.item_id in failed_item_ids
             and question.item_id not in retried_item_ids
         )
 
+    @staticmethod
+    def _fixture_active(lesson_session_id: str) -> ActiveLesson:
+        retries = tuple(
+            RETRY_QUESTIONS[question.question_id]
+            for question in FIXTURE_LESSON.questions
+        )
+        return ActiveLesson(lesson_session_id, FIXTURE_LESSON, retries)
+
+    @staticmethod
+    def _require_session(active: ActiveLesson, lesson_session_id: str) -> None:
+        if active.lesson_session_id != lesson_session_id:
+            raise LessonStateError("This lesson session is no longer active.")
+
     def complete_fixture_lesson(
         self, user_id: int, lesson_session_id: str
     ) -> CompletionRecord:
+        return self.complete_lesson(user_id, self._fixture_active(lesson_session_id))
+
+    def complete_lesson(
+        self, user_id: int, active_lesson: ActiveLesson
+    ) -> CompletionRecord:
+        lesson_session_id = active_lesson.lesson_session_id
+        lesson = active_lesson.lesson
         now = self._clock()
         with Session(self._engine) as session:
             existing = session.scalar(
@@ -698,18 +882,20 @@ class LessonService:
                     ReviewAttempt.is_retry.is_(False),
                 )
             )
-            if attempt_count != len(FIXTURE_LESSON.questions):
+            if attempt_count != len(lesson.questions):
                 raise LessonStateError("Answer every question before completing the lesson.")
-            if self.get_pending_retries(user_id, lesson_session_id):
+            if self.get_pending_retries(
+                user_id, lesson_session_id, active_lesson=active_lesson
+            ):
                 raise LessonStateError("Complete each corrective retry before finishing.")
 
             completion = CompletedLessonMetadata(
                 user_id=user_id,
                 lesson_session_id=lesson_session_id,
-                topic_id=FIXTURE_LESSON.topic_id,
-                difficulty=FIXTURE_LESSON.difficulty,
+                topic_id=lesson.topic_id,
+                difficulty=lesson.difficulty,
                 studied_item_ids=[
-                    item.canonical_id for item in FIXTURE_LESSON.items
+                    item.canonical_id for item in lesson.items
                 ],
                 completed_at=now,
             )

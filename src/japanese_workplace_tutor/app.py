@@ -1,6 +1,7 @@
 """Streamlit application with persistent local demo authentication."""
 
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import streamlit as st
@@ -8,13 +9,22 @@ from sqlalchemy import Engine
 
 from .auth import AuthenticationError, AuthenticationService, RegistrationError
 from .database import check_database, create_database_engine
+from .generation import (
+    GenerationError,
+    GeneratedQuiz,
+    LessonGenerationService,
+    OpenAICompatibleTransport,
+    ScenarioMode,
+    detect_scenario_mode,
+)
 from .lesson import (
     ActiveLesson,
+    ActiveLessonDraft,
     ActiveReview,
     FIXTURE_LESSON,
-    RETRY_QUESTIONS,
     LessonService,
     LessonStateError,
+    ProgressRecord,
 )
 from .profile import (
     JapaneseLevel,
@@ -26,6 +36,40 @@ from .profile import (
 from .settings import Settings, get_settings
 
 PageRenderer = Callable[[], None]
+
+
+@st.cache_resource
+def _quiz_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=2, thread_name_prefix="quiz-generation")
+
+
+@st.cache_resource
+def _generation_service(
+    base_url: str,
+    _api_key: str,
+    primary_model: str,
+    fallback_model: str,
+    timeout_seconds: float,
+    primary_timeout_seconds: float,
+) -> LessonGenerationService:
+    return LessonGenerationService(
+        OpenAICompatibleTransport(base_url, _api_key, timeout_seconds),
+        primary_model,
+        fallback_model,
+        primary_timeout_seconds=primary_timeout_seconds,
+    )
+
+
+def _start_quiz_generation(
+    generation_service: LessonGenerationService,
+    draft: ActiveLessonDraft,
+    learning_history: tuple[ProgressRecord, ...],
+) -> Future[GeneratedQuiz]:
+    return _quiz_executor().submit(
+        generation_service.generate_quiz,
+        draft.content,
+        learning_history,
+    )
 
 
 def _clear_active_review() -> None:
@@ -172,17 +216,27 @@ def render_home(
 
 
 def _clear_active_lesson() -> None:
+    future = st.session_state.get("quiz_generation_future")
+    if isinstance(future, Future):
+        future.cancel()
     for key in list(st.session_state):
         if key in {
             "active_fixture_lesson",
+            "active_lesson",
+            "active_lesson_draft",
             "lesson_answer_results",
             "lesson_retry_results",
-        } or key.startswith(("fixture_answer_", "fixture_retry_")):
+            "quiz_generation_future",
+            "quiz_generation_error",
+        } or key.startswith(("lesson_answer_", "lesson_retry_")):
             st.session_state.pop(key, None)
 
 
 def render_learn(
-    service: LessonService | None = None, user_id: int | None = None
+    service: LessonService | None = None,
+    user_id: int | None = None,
+    profile: ProfileRecord | None = None,
+    generation_service: LessonGenerationService | None = None,
 ) -> None:
     st.title("Learn")
     if service is None or user_id is None:
@@ -193,14 +247,71 @@ def render_learn(
         st.success("Lesson completed. Your compact progress and review schedule were saved.")
         st.session_state.pop("last_lesson_completion", None)
 
-    active = st.session_state.get("active_fixture_lesson")
-    if not isinstance(active, ActiveLesson):
+    active = st.session_state.get("active_lesson")
+    draft = st.session_state.get("active_lesson_draft")
+    if not isinstance(active, ActiveLesson) and not isinstance(draft, ActiveLessonDraft):
+        st.subheader("Create a scenario lesson")
+        scenario = st.text_area(
+            "Workplace situation, goal, or Japanese text",
+            max_chars=4000,
+            key="lesson_scenario",
+            placeholder="For example: I need to clarify a requirement with my manager.",
+        )
+        detected_mode = detect_scenario_mode(scenario) if scenario.strip() else ScenarioMode.GENERATE
+        mode_options = [mode.value for mode in ScenarioMode]
+        selected_mode = st.radio(
+            "Lesson mode",
+            mode_options,
+            index=mode_options.index(detected_mode.value),
+            key=f"scenario_mode_{detected_mode.name.lower()}",
+            horizontal=True,
+        )
+        st.caption(f"Detected/default mode: {detected_mode.value}. Confirm or change it above.")
+        generation_disabled = generation_service is None or profile is None
+        if generation_disabled:
+            st.info("Scenario generation is unavailable until model configuration is complete.")
+        if st.button(
+            "Generate lesson",
+            type="primary",
+            key="generate_scenario_lesson",
+            disabled=generation_disabled,
+        ) and generation_service is not None and profile is not None:
+            try:
+                learning_history = service.get_progress(user_id)
+                generated = generation_service.generate_lesson_content(
+                    scenario,
+                    ScenarioMode(selected_mode),
+                    profile,
+                    learning_history=learning_history,
+                    recent_topic_ids=tuple(
+                        completion.topic_id
+                        for completion in service.get_completions(user_id)[:10]
+                    ),
+                )
+            except GenerationError as error:
+                st.error(str(error))
+            else:
+                _clear_active_lesson()
+                active_draft = service.start_generated_lesson_draft(
+                    user_id, generated
+                )
+                st.session_state.active_lesson_draft = active_draft
+                st.session_state.quiz_generation_future = _start_quiz_generation(
+                    generation_service,
+                    active_draft,
+                    tuple(learning_history),
+                )
+                st.session_state.lesson_answer_results = {}
+                st.session_state.lesson_retry_results = {}
+                st.rerun()
+
+        st.divider()
         st.subheader(FIXTURE_LESSON.title)
         st.write("Study five workplace Japanese targets, then answer five questions.")
         st.caption("Opening the lesson records exposure only. It does not raise mastery.")
-        if st.button("Start fixture lesson", type="primary", key="start_fixture_lesson"):
+        if st.button("Start fixture lesson", key="start_fixture_lesson"):
             _clear_active_lesson()
-            st.session_state.active_fixture_lesson = service.start_fixture_lesson(
+            st.session_state.active_lesson = service.start_fixture_lesson(
                 user_id
             )
             st.session_state.lesson_answer_results = {}
@@ -208,24 +319,99 @@ def render_learn(
             st.rerun()
         return
 
-    lesson = active.lesson
+    if isinstance(active, ActiveLesson):
+        lesson = active.lesson
+        line_explanations = active.line_explanations
+        provider_name = active.provider_name
+    else:
+        lesson = draft.content
+        line_explanations = draft.line_explanations
+        provider_name = draft.provider_name
     st.subheader(lesson.title)
     st.caption(f"Difficulty: {lesson.difficulty}")
-    st.write(lesson.passage)
+    if provider_name is not None:
+        st.caption(f"Lesson generated with {provider_name}")
+    st.subheader("Lesson Conversation")
+    for dialogue_line in lesson.passage.splitlines():
+        if dialogue_line.strip():
+            st.write(dialogue_line)
 
-    st.subheader("Target items")
-    for item in lesson.items:
-        with st.expander(f"{item.expression} · {item.category.value}"):
-            st.write(f"Reading: {item.reading}")
-            st.write(f"Meaning: {item.meaning}")
-            st.write(f"Example: {item.example}")
+    if line_explanations:
+        st.subheader("Explanation")
+        for number, line in enumerate(line_explanations, start=1):
+            separator = ":" if ":" in line.japanese_text else "："
+            speaker = line.japanese_text.split(separator, 1)[0].strip()
+            st.markdown(f"### {speaker} — Line {number}")
+            st.markdown("**Japanese:**")
+            st.write(line.japanese_text)
+            st.markdown("**English meaning:**")
+            st.write(line.english_meaning)
+            for label, points in (
+                ("Kanji", line.kanji),
+                ("Vocabulary", line.vocabulary),
+                ("Grammar", line.grammar),
+            ):
+                st.markdown(f"**{label}:**")
+                if points:
+                    for point in points:
+                        st.write(
+                            f"{point.expression} ({point.reading}): "
+                            f"{point.meaning}. {point.explanation}"
+                        )
+                else:
+                    st.write(f"No {label.lower()} to explain in this line.")
+
+    if isinstance(draft, ActiveLessonDraft):
+        future = st.session_state.get("quiz_generation_future")
+        quiz_error = st.session_state.get("quiz_generation_error")
+        if isinstance(quiz_error, str):
+            st.error(quiz_error)
+            if generation_service is not None and st.button(
+                "Retry quiz preparation", key="retry_quiz_generation"
+            ):
+                st.session_state.pop("quiz_generation_error", None)
+                st.session_state.quiz_generation_future = _start_quiz_generation(
+                    generation_service,
+                    draft,
+                    tuple(service.get_progress(user_id)),
+                )
+                st.rerun()
+        elif isinstance(future, Future):
+            if future.done():
+                st.caption("Your personalized quiz is ready.")
+            else:
+                st.caption("Your personalized quiz is being prepared while you study.")
+            if st.button("Quiz", type="primary", key="go_to_quiz"):
+                with st.spinner("Preparing your personalized quiz..."):
+                    try:
+                        generated_quiz = future.result()
+                    except Exception:
+                        st.session_state.pop("quiz_generation_future", None)
+                        st.session_state.quiz_generation_error = (
+                            "We could not prepare a valid quiz. Your lesson is still available."
+                        )
+                    else:
+                        st.session_state.active_lesson = (
+                            service.activate_generated_quiz(draft, generated_quiz)
+                        )
+                        st.session_state.pop("active_lesson_draft", None)
+                        st.session_state.pop("quiz_generation_future", None)
+                    st.rerun()
+        else:
+            st.error("Quiz preparation was interrupted. Your lesson is still available.")
+        if st.button("Leave lesson", key="leave_generated_lesson_draft"):
+            _clear_active_lesson()
+            st.rerun()
+        return
 
     st.subheader("Practice")
+    if active.quiz_provider_name is not None:
+        st.caption(f"Quiz generated with {active.quiz_provider_name}")
     answer_results = st.session_state.setdefault("lesson_answer_results", {})
     for number, question in enumerate(lesson.questions, start=1):
         st.markdown(f"**{number}. {question.prompt}**")
         st.caption(question.form.value.replace("_", " ").title())
-        answer_key = f"fixture_answer_{active.lesson_session_id}_{question.question_id}"
+        answer_key = f"lesson_answer_{active.lesson_session_id}_{question.question_id}"
         selected_answer = st.radio(
             f"Answer for question {number}",
             question.options,
@@ -252,14 +438,17 @@ def render_learn(
                     active.lesson_session_id,
                     question.question_id,
                     question.options.index(selected_answer),
+                    active_lesson=active,
                 )
                 answer_results[question.question_id] = result.is_correct
                 st.rerun()
 
     if len(answer_results) == len(lesson.questions):
         required_retries = [
-            RETRY_QUESTIONS[question.question_id]
-            for question in lesson.questions
+            retry
+            for question, retry in zip(
+                lesson.questions, active.retry_questions, strict=True
+            )
             if answer_results.get(question.question_id) is False
         ]
         retry_results = st.session_state.setdefault("lesson_retry_results", {})
@@ -272,7 +461,7 @@ def render_learn(
         for number, retry in enumerate(required_retries, start=1):
             st.markdown(f"**Retry {number}. {retry.prompt}**")
             st.caption(retry.form.value.replace("_", " ").title())
-            retry_key = f"fixture_retry_{active.lesson_session_id}_{retry.question_id}"
+            retry_key = f"lesson_retry_{active.lesson_session_id}_{retry.question_id}"
             selected_retry = st.radio(
                 f"Answer for retry {number}",
                 retry.options,
@@ -300,6 +489,7 @@ def render_learn(
                         active.lesson_session_id,
                         retry.question_id,
                         retry.options.index(selected_retry),
+                        active_lesson=active,
                     )
                     retry_results[retry.question_id] = result.is_correct
                     st.rerun()
@@ -317,7 +507,7 @@ def render_learn(
         st.write(lesson.recap)
         if st.button("Complete lesson", type="primary", key="complete_fixture_lesson"):
             try:
-                service.complete_fixture_lesson(user_id, active.lesson_session_id)
+                service.complete_lesson(user_id, active)
             except LessonStateError as error:
                 st.error(str(error))
             else:
@@ -374,7 +564,7 @@ def render_progress(
                 ),
             }
         )
-    st.dataframe(rows, hide_index=True, use_container_width=True)
+    st.dataframe(rows, hide_index=True, width="stretch")
     completions = service.get_completions(user_id)
     if completions:
         latest = completions[0]
@@ -621,6 +811,23 @@ def main() -> None:
     user_id = int(st.session_state.authenticated_user_id)
     profile_service = ProfileService(engine)
     lesson_service = LessonService(engine)
+    generation_service = None
+    if settings.model_configured:
+        api_key = settings.model_api_key
+        if (
+            settings.model_base_url is not None
+            and api_key is not None
+            and settings.primary_model is not None
+            and settings.fallback_model is not None
+        ):
+            generation_service = _generation_service(
+                settings.model_base_url,
+                api_key.get_secret_value(),
+                settings.primary_model,
+                settings.fallback_model,
+                settings.model_timeout_seconds,
+                settings.primary_model_timeout_seconds,
+            )
     profile = profile_service.get_profile(user_id)
     if profile is None:
         render_profile_editor(profile_service, user_id, None)
@@ -633,7 +840,7 @@ def main() -> None:
     if selected_page == "Home":
         render_home(profile, lesson_service, user_id)
     elif selected_page == "Learn":
-        render_learn(lesson_service, user_id)
+        render_learn(lesson_service, user_id, profile, generation_service)
     elif selected_page == "Progress":
         render_progress(lesson_service, user_id)
     elif selected_page == "Profile":
